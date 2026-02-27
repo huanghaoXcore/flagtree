@@ -15,12 +15,15 @@ def _get_flagtree_root() -> str:
     return str(Path(__file__).resolve().parents[3])
 
 
+flagtree_root_dir = _get_flagtree_root()
+
+
 @dataclass
 class FlagtreeConfigs:
     default_backends: tuple = ("nvidia", "amd")
     plugin_backends: tuple = ("ascend", "aipu", "tsingmicro")
     use_cuda_toolkit_backends: tuple = ("aipu", )
-    language_extra_backends: tuple = ("xpu", "mthreads", "cambricon", "ascend")
+    language_extra_backends: tuple = ("xpu", "mthreads", "cambricon")
     ext_sourcedir: str = "triton/_C/"
     flagtree_root_dir: str = field(default_factory=_get_flagtree_root)
     flagtree_backend: str = field(default_factory=lambda: os.environ.get("FLAGTREE_BACKEND"))
