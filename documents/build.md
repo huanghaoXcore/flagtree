@@ -67,8 +67,8 @@ wget https://klx-sdk-release-public.su.bcebos.com/v1/triton/flaggems/2025_4_seas
 tar zxvf XTDK-llvm19-ubuntu2004_x86_64.tar.gz
 wget https://baai-cp-web.ks3-cn-beijing.ksyuncs.com/trans/xre-Linux-x86_64_v0.3.0.tar.gz
 tar zxvf xre-Linux-x86_64_v0.3.0.tar.gz
-wget https://baai-cp-web.ks3-cn-beijing.ksyuncs.com/trans/xpu-liblaunch_shared_so-ubuntu-x64_v0.3.1.tar.gz
-tar zxvf xpu-liblaunch_shared_so-ubuntu-x64_v0.3.1.tar.gz
+wget https://klx-sdk-release-public.su.bcebos.com/XTriton/xpu-device-libs-ubuntu-x64_v0.3.6.1.1.tar.gz
+tar zxvf xpu-device-libs-ubuntu-x64_v0.3.6.1.1.tar.gz
 ```
 
 ##### 3. Manually download the Triton dependencies
