@@ -1,5 +1,5 @@
-#ifndef TRITON_CONVERSION_TRITONMTGPU_TO_LLVM_PATTERNS_TRITON_GPU_OP_TO_LLVM_H
-#define TRITON_CONVERSION_TRITONMTGPU_TO_LLVM_PATTERNS_TRITON_GPU_OP_TO_LLVM_H
+#ifndef TRITON_CONVERSION_TRITONMTHREADSGPU_TO_LLVM_PATTERNS_TRITON_GPU_OP_TO_LLVM_H
+#define TRITON_CONVERSION_TRITONMTHREADSGPU_TO_LLVM_PATTERNS_TRITON_GPU_OP_TO_LLVM_H
 
 #include "TargetInfo.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
@@ -54,7 +54,13 @@ void populateClampFOpToLLVMPattern(LLVMTypeConverter &typeConverter,
 
 void populateFuncOpConversionPattern(LLVMTypeConverter &typeConverter,
                                      RewritePatternSet &patterns, int numWarps,
+                                     int threadsPerWarp,
                                      PatternBenefit benefit);
+
+void populateReduceOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
+                                    RewritePatternSet &patterns,
+                                    const TargetInfoBase &targetInfo,
+                                    PatternBenefit benefit);
 } // namespace MUSA
 } // namespace triton
 } // namespace mlir

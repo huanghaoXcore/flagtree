@@ -1,8 +1,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/IR/Attributes.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
-#include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/ADT/STLExtras.h"
@@ -12,7 +11,7 @@ using CoordTy = SmallVector<Value>;
 using ValueTable = std::map<std::pair<int, int>, std::pair<Value, Value>>;
 
 static SmallVector<CoordTy>
-getMNCoords(Value thread, Location loc, ConversionPatternRewriter &rewriter,
+getMNCoords(Value thread, Location loc, RewriterBase &rewriter,
             ArrayRef<unsigned int> wpt, const NvidiaMmaEncodingAttr &mmaLayout,
             ArrayRef<int64_t> shape, bool isARow, bool isBRow, bool isAVec4,
             bool isBVec4) {
@@ -111,6 +110,7 @@ getMNCoords(Value thread, Location loc, ConversionPatternRewriter &rewriter,
   return coords; // {M,N} in row-major
 }
 } // namespace SharedToDotOperandMMAv1
+
 namespace mlir {
 
 namespace triton::gpu {
@@ -119,9 +119,8 @@ Type getFunctionType(Type resultType, ValueRange operands) {
   return LLVM::LLVMFunctionType::get(resultType, operandTypes);
 }
 
-LLVM::LLVMFuncOp appendOrGetExternFuncOp(ConversionPatternRewriter &rewriter,
-                                         Operation *op, StringRef funcName,
-                                         Type funcType,
+LLVM::LLVMFuncOp appendOrGetExternFuncOp(RewriterBase &rewriter, Operation *op,
+                                         StringRef funcName, Type funcType,
                                          StringRef libname /*= ""*/,
                                          StringRef libpath /*= ""*/) {
   using LLVM::LLVMFuncOp;
@@ -164,7 +163,7 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   // Manually constant-fold the layout where possible.
   SmallVector<std::pair<StringAttr, int32_t>> constantIns;
   for (auto [inDimName, idx] : indices) {
-    if (auto constant = dyn_cast<LLVM::ConstantOp>(idx.getDefiningOp())) {
+    if (auto constant = idx.getDefiningOp<LLVM::ConstantOp>()) {
       constantIns.push_back(
           {inDimName, cast<IntegerAttr>(constant.getValue()).getInt()});
     } else {
@@ -184,7 +183,7 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   }
 
   for (auto [inDimName, idx] : indices) {
-    if (isa<LLVM::ConstantOp>(idx.getDefiningOp())) {
+    if (idx.getDefiningOp<LLVM::ConstantOp>()) {
       continue;
     }
 
@@ -204,53 +203,263 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   return outIndices;
 }
 
-std::optional<SmallVector<SmallVector<Value>>>
-emitIndicesUsingLinearLayouts(Location loc, RewriterBase &rewriter,
-                              const TargetInfoBase &target, Attribute layout,
-                              RankedTensorType type, bool withCTAOffset) {
+SmallVector<SmallVector<Value>>
+emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
+            Attribute layout, RankedTensorType type, bool withCTAOffset) {
   MLIRContext *ctx = rewriter.getContext();
   auto shape = type.getShape();
 
-  std::optional<LinearLayout> ll = triton::gpu::toLinearLayout(shape, layout);
-  if (!ll.has_value()) {
-    return std::nullopt;
+  if (target.supportsLinearLayouts()) {
+    std::optional<LinearLayout> ll = triton::gpu::toLinearLayout(shape, layout);
+    if (ll.has_value()) {
+      // TODO(jlebar): We could add strong typing if we wanted; for now this is
+      // "stringly typed".
+      StringAttr kRegister = str_attr("register");
+      StringAttr kLane = str_attr("lane");
+      StringAttr kWarp = str_attr("warp");
+      StringAttr kBlock = str_attr("block");
+
+      Value threadId = getThreadId(rewriter, loc);
+      Value threadsPerWarp = i32_val(ll->getInDimSize(kLane));
+      Value laneId = urem(threadId, threadsPerWarp);
+      Value warpId = udiv(threadId, threadsPerWarp);
+      Value warpIdForLayout = warpId;
+
+      if (auto dot =
+              mlir::dyn_cast<triton::gpu::DotOperandEncodingAttr>(layout)) {
+        if (auto mma =
+                mlir::dyn_cast<MthreadsWmmaEncodingAttr>(dot.getParent())) {
+          if (mma.isPH1()) {
+            auto warpsPerCTA = mma.getWarpsPerCTA();
+            int64_t TILE_M = warpsPerCTA[0];
+            int64_t TILE_N = warpsPerCTA[1];
+            if (TILE_M > 1 && TILE_N > 1) {
+              Value warp_m = udiv(warpId, i32_val(TILE_N));
+              Value warp_n = urem(warpId, i32_val(TILE_N));
+              warpIdForLayout = (dot.getOpIdx() == 0) ? warp_m : warp_n;
+            }
+          }
+        }
+      }
+
+      Value blockId =
+          withCTAOffset ? target.getClusterCTAId(rewriter, loc) : i32_val(0);
+      unsigned rank = shape.size();
+      SmallVector<SmallVector<Value>> ret;
+      // Linear layout function is split in two parts below:
+      // L(r, t, w, b) = L(0, t, w, b) xor L(r, 0, 0, 0)
+      //     idxs      =    idxsBase   xor    idxsReg
+      //
+      // L(0, t, w, b) part is the same for all registers,
+      // so we hoist it out of the main register loop in the below.
+      //
+      // This approach produces code with lower register pressure and
+      // less computations, compared to fused L(r,t,w,b) method.
+      auto idxsBase = applyLinearLayout(loc, rewriter, *ll,
+                                        {{kRegister, i32_val(0)},
+                                         {kLane, laneId},
+                                         {kWarp, warpIdForLayout},
+                                         {kBlock, blockId}});
+      for (unsigned reg = 0; reg < ll->getInDimSize(str_attr("register"));
+           reg++) {
+        auto idxsReg =
+            ll->apply({{kRegister, reg}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+        SmallVector<std::pair<StringAttr, Value>> idxs;
+        for (auto [idxBase, idxReg] : llvm::zip(idxsBase, idxsReg)) {
+          auto dimName = idxBase.first;
+          assert(dimName == idxReg.first &&
+                 "dim names of block+warp+thread and register idx should be "
+                 "equal");
+          auto idx = xor_(idxBase.second, i32_val(idxReg.second));
+          idxs.emplace_back(dimName, idx);
+        }
+        assert(idxs.size() == rank);
+        for (unsigned k = 0; k < rank; ++k) {
+          assert(idxs[k].first == str_attr("dim" + std::to_string(k)));
+        }
+        ret.push_back(llvm::to_vector(llvm::make_second_range(idxs)));
+      }
+
+      return ret;
+    }
   }
 
-  // TODO(jlebar): We could add strong typing if we wanted; for now this is
-  // "stringly typed".
+  // Legacy path: use hand-written offset emitters.
+  auto multiDimBase = emitBaseIndexForLayout(loc, rewriter, target, layout,
+                                             type, withCTAOffset);
+  auto offsets = emitOffsetForLayout(layout, type);
+  auto rank = shape.size();
+  auto elemsPerThread = offsets.size();
+  SmallVector<SmallVector<Value>> ret(elemsPerThread, SmallVector<Value>(rank));
+  for (unsigned n = 0; n < elemsPerThread; ++n)
+    for (unsigned k = 0; k < rank; ++k)
+      ret[n][k] = add(multiDimBase[k], i32_val(offsets[n][k]));
+  return ret;
+}
+
+bool emitTransferBetweenRegistersAndShared(
+    RankedTensorType registerTy, MemDescType sharedTy, Type elemLlvmTy,
+    std::optional<int32_t> maxVecElems, Value shmemBase,
+    ArrayRef<Value> shmemStrides, Location loc, RewriterBase &rewriter,
+    const TargetInfoBase &target,
+    std::function<void(VectorType, Value /*shmemAddr*/)> perVectorCallback) {
+  MLIRContext *ctx = rewriter.getContext();
+
+  auto shape = registerTy.getShape();
+  int rank = shape.size();
+
+  StringAttr kBlock = str_attr("block");
   StringAttr kRegister = str_attr("register");
   StringAttr kLane = str_attr("lane");
   StringAttr kWarp = str_attr("warp");
-  StringAttr kBlock = str_attr("block");
 
-  Value threadId = getThreadId(rewriter, loc);
-  Value threadsPerWarp = i32_val(ll->getInDimSize(kLane));
-  Value laneId = urem(threadId, threadsPerWarp);
-  Value warpId = udiv(threadId, threadsPerWarp);
-  Value blockId =
-      withCTAOffset ? target.getClusterCTAId(rewriter, loc) : i32_val(0);
-  unsigned rank = shape.size();
-  SmallVector<SmallVector<Value>> ret;
-  for (unsigned reg = 0; reg < ll->getInDimSize(str_attr("register")); reg++) {
-    auto idxs = applyLinearLayout(loc, rewriter, *ll,
-                                  {{kRegister, i32_val(reg)},
-                                   {kLane, laneId},
-                                   {kWarp, warpId},
-                                   {kBlock, blockId}});
-    assert(idxs.size() == rank);
-    for (unsigned k = 0; k < rank; ++k) {
-      assert(idxs[k].first == str_attr("dim" + std::to_string(k)));
+  std::optional<LinearLayout> regLayout =
+      triton::gpu::toLinearLayout(shape, registerTy.getEncoding());
+  std::optional<LinearLayout> sharedLayout = triton::gpu::toLinearLayout(
+      shape, sharedTy.getEncoding(), elemLlvmTy.getIntOrFloatBitWidth());
+  if (!regLayout.has_value() || !sharedLayout.has_value()) {
+    return false;
+  }
+  auto sharedOrder = triton::gpu::getOrder(sharedTy.getEncoding());
+
+  // sharedLayout's in-dims are currently (offset, block).  Reshape to
+  // (offsetX1, offsetX2, ..., block) so that we can apply the N-dimensional
+  // shmem strides.  (The offsetX's appear in minor-to-major order.)
+  auto sharedLegacy =
+      cast<triton::gpu::SharedEncodingAttr>(sharedTy.getEncoding());
+  SmallVector<std::pair<StringAttr, int32_t>> multiDimSharedSize;
+  for (int i = 0; i < rank; i++) {
+    int dim = sharedOrder[i];
+    int64_t size = std::max(
+        int64_t{1},
+        shape[dim] / sharedLegacy.getCTALayout().getCTASplitNum()[dim]);
+    multiDimSharedSize.push_back(
+        {str_attr("offset" + std::to_string(dim)), size});
+  }
+  multiDimSharedSize.push_back({kBlock, sharedLayout->getInDimSize(kBlock)});
+  sharedLayout = sharedLayout->reshapeIns(multiDimSharedSize);
+
+  // regToSharedLayout maps from (register, lane, warp, block) to (offsetX1,
+  // ..., offsetXN, block), where the offsetX's are in minor-to-major order.
+  LinearLayout regToSharedLayout = regLayout->invertAndCompose(*sharedLayout);
+
+  // TODO(jlebar): We don't currently support loading from shared memory in a
+  // different CTA.  We'd need to emit `mapa.shared::cluster` instructions.
+  for (int inBlock = 1; inBlock < regToSharedLayout.getInDimSize(kBlock);
+       inBlock *= 2) {
+    auto idx = llvm::to_vector(llvm::make_second_range(regToSharedLayout.apply(
+        {{kRegister, 0}, {kLane, 0}, {kWarp, 0}, {kBlock, inBlock}})));
+    // offsetX1, ..., offsetXN must all be 0.
+    if (!llvm::all_of(ArrayRef(idx).drop_back(1),
+                      [&](auto offset) { return offset == 0; })) {
+      return false;
     }
-    ret.push_back(llvm::to_vector(llvm::make_second_range(idxs)));
+    // Check if there's any cross CTA load.
+    int32_t outBlock = idx.back();
+    if (outBlock != inBlock) {
+      return false;
+    }
   }
 
-  return ret;
+  // Determine how many consecutive registers map to consecutive shmem elements
+  // in out-dimension offsetN.  This is our load instruction's vector width.
+  //
+  // It's OK if the vector width we choose here is wider than the hardware
+  // supports; LLVM will legalize it.
+  //
+  // TODO(jlebar): shmemStrides are Values, but most of them are usually integer
+  // constants.  We could add those constant strides to the LL, and then before
+  // calling getNumConsecutiveInOut(), we could flatten consecutive out-dims
+  // which have known strides.  This would allow us to vectorize across multiple
+  // shmem out dimensions where possible.
+  const int vecElems =
+      std::min(regToSharedLayout.getNumConsecutiveInOut(),
+               maxVecElems.value_or(std::numeric_limits<int>::max()));
+
+  Value threadId = getThreadId(rewriter, loc);
+  Value threadsPerWarp = i32_val(regToSharedLayout.getInDimSize(kLane));
+  Value laneId = urem(threadId, threadsPerWarp);
+  Value warpId = udiv(threadId, threadsPerWarp);
+
+  int numElems = regToSharedLayout.getInDimSize(kRegister);
+  auto vecTy = vec_ty(elemLlvmTy, vecElems);
+  auto ptrTy = shmemBase.getType();
+  Value zero = i32_val(0);
+  SmallVector<Value> ret;
+  for (int i = 0; i < numElems / vecElems; i++) {
+    // Get the address to load/store.  The multi-dim address is (offsetX1, ...,
+    // offsetXN, block), where the offsets appear in minor-to-major order, and
+    // we drop_end to drop block, which we know from above will be 0.
+    auto multiDimShmemOffset =
+        llvm::to_vector(llvm::drop_end(llvm::make_second_range(
+            applyLinearLayout(loc, rewriter, regToSharedLayout,
+                              {{kRegister, i32_val(i * vecElems)},
+                               {kLane, laneId},
+                               {kWarp, warpId},
+                               {kBlock, zero}}))));
+
+    // Reorder strides according to `order`.  This way they match the
+    // multi-dimensional offsets in regToSharedLayout.
+    Value shmemOffset = dot(rewriter, loc, multiDimShmemOffset,
+                            applyPermutation(shmemStrides, sharedOrder));
+    auto vecAddr = gep(ptrTy, elemLlvmTy, shmemBase, shmemOffset);
+    vecAddr.setInbounds(true);
+
+    perVectorCallback(vecTy, vecAddr);
+  }
+  return true;
+}
+
+SmallVector<SmallVector<unsigned>> emitOffsetForLayout(Attribute layout,
+                                                       RankedTensorType type) {
+  if (auto blockedLayout = dyn_cast<BlockedEncodingAttr>(layout))
+    return emitOffsetForBlockedLayout(blockedLayout, type);
+  if (auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(layout)) {
+    if (mmaLayout.isVolta())
+      return emitOffsetForMmaLayoutV1(mmaLayout, type);
+    if (mmaLayout.isAmpere())
+      return emitOffsetForMmaLayoutV2(mmaLayout, type);
+    if (mmaLayout.isHopper())
+      return emitOffsetForMmaLayoutV3(mmaLayout, type);
+  }
+  if (auto mfmaLayout = mlir::dyn_cast<AMDMfmaEncodingAttr>(layout)) {
+    return emitOffsetForMfmaLayout(mfmaLayout, type);
+  }
+  if (auto wmmaLayout = mlir::dyn_cast<AMDWmmaEncodingAttr>(layout)) {
+    return emitOffsetForWmmaLayout(wmmaLayout, type);
+  }
+
+  if (isa<MthreadsWmmaEncodingAttr>(layout) ||
+      isa<DotOperandEncodingAttr>(layout)) {
+    auto mmaLayout = mlir::dyn_cast<MthreadsWmmaEncodingAttr>(layout);
+    if (!mmaLayout) {
+      mmaLayout = mlir::dyn_cast<MthreadsWmmaEncodingAttr>(
+          mlir::cast<DotOperandEncodingAttr>(layout).getParent());
+    }
+    if (mmaLayout) {
+      return emitOffsetForMthreadsWmmaLayout(layout, mmaLayout, type);
+    }
+  }
+
+  if (auto mtmmaLayout = mlir::dyn_cast<MthreadsSqmmaEncodingAttr>(layout)) {
+    return emitOffsetForMtMmaLayout(mtmmaLayout, type);
+  }
+
+  if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(layout))
+    return emitOffsetForSliceLayout(sliceLayout, type);
+  llvm::report_fatal_error("unsupported emitOffsetForLayout");
 }
 
 namespace LLVM {
 using namespace mlir::triton;
 using mlir::triton::gpu::getOrder;
 using mlir::triton::gpu::getSizePerThread;
+
+Value createConstantI1(Location loc, OpBuilder &rewriter, bool v) {
+  auto i1ty = rewriter.getIntegerType(1);
+  return rewriter.create<LLVM::ConstantOp>(loc, i1ty,
+                                           IntegerAttr::get(i1ty, v));
+}
 
 Value createConstantI32(Location loc, OpBuilder &rewriter, int32_t v) {
   auto i32ty = rewriter.getIntegerType(32);
@@ -306,9 +515,40 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
                                           builder.getIntegerAttr(ty, value));
 }
 
-SharedMemoryObject
-getSharedMemoryObjectFromStruct(Location loc, Value llvmStruct, Type elemTy,
-                                ConversionPatternRewriter &rewriter) {
+LLVM::CallOp createLLVMCallOp(OpBuilder &builder, Location loc,
+                              LLVMFuncOp funcOp, ValueRange args) {
+  auto op = builder.create<LLVM::CallOp>(loc, funcOp, args);
+  op.getProperties().setOpBundleSizes(builder.getDenseI32ArrayAttr({}));
+  op.getProperties().setOperandSegmentSizes({static_cast<int>(args.size()), 0});
+  return op;
+}
+
+LLVM::CallIntrinsicOp
+createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
+                          TypeRange types, ValueRange args) {
+  auto op = builder.create<LLVM::CallIntrinsicOp>(loc, types, args);
+  op.getProperties().setIntrin(builder.getStringAttr(intrinsic));
+  op.getProperties().setOpBundleSizes(builder.getDenseI32ArrayAttr({}));
+  op.getProperties().setOperandSegmentSizes({static_cast<int>(args.size()), 0});
+  return op;
+}
+
+bool isConstantZero(Value v) {
+  if (auto constantOp = v.getDefiningOp<arith::ConstantOp>()) {
+    if (auto attr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
+      return attr.getValue().isZero();
+    }
+    if (auto attr = dyn_cast<FloatAttr>(constantOp.getValue())) {
+      return attr.getValue().isZero();
+    }
+  }
+  return false;
+}
+
+SharedMemoryObject getSharedMemoryObjectFromStruct(Location loc,
+                                                   Value llvmStruct,
+                                                   Type elemTy,
+                                                   RewriterBase &rewriter) {
   ArrayRef<Type> types =
       cast<LLVM::LLVMStructType>(llvmStruct.getType()).getBody();
   SmallVector<Value> elems(types.size());
@@ -390,15 +630,14 @@ SmallVector<Value> delinearize(RewriterBase &rewriter, Location loc,
   return multiDim;
 }
 
-Value linearize(ConversionPatternRewriter &rewriter, Location loc,
-                ArrayRef<Value> multiDim, ArrayRef<unsigned> shape,
-                ArrayRef<unsigned> order) {
+Value linearize(RewriterBase &rewriter, Location loc, ArrayRef<Value> multiDim,
+                ArrayRef<unsigned> shape, ArrayRef<unsigned> order) {
   return linearize(rewriter, loc, applyPermutation(multiDim, order),
                    applyPermutation(shape, order));
 }
 
-Value linearize(ConversionPatternRewriter &rewriter, Location loc,
-                ArrayRef<Value> multiDim, ArrayRef<unsigned> shape) {
+Value linearize(RewriterBase &rewriter, Location loc, ArrayRef<Value> multiDim,
+                ArrayRef<unsigned> shape) {
   auto rank = multiDim.size();
   Value linear = i32_val(0);
   if (rank > 0) {
@@ -412,8 +651,8 @@ Value linearize(ConversionPatternRewriter &rewriter, Location loc,
   return linear;
 }
 
-Value addStringToModule(Location loc, ConversionPatternRewriter &rewriter,
-                        StringRef key, StringRef content) {
+Value addStringToModule(Location loc, RewriterBase &rewriter, StringRef key,
+                        StringRef content) {
   auto moduleOp = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
   auto ctx = moduleOp.getContext();
   unsigned stringNumber = 0;
@@ -429,7 +668,7 @@ Value addStringToModule(Location loc, ConversionPatternRewriter &rewriter,
 
   LLVM::GlobalOp global;
   {
-    ConversionPatternRewriter::InsertionGuard guard(rewriter);
+    RewriterBase::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(moduleOp.getBody());
     global = rewriter.create<LLVM::GlobalOp>(
         UnknownLoc::get(ctx), globalType,
@@ -447,7 +686,7 @@ Value addStringToModule(Location loc, ConversionPatternRewriter &rewriter,
 }
 
 SmallVector<Value> getMultiDimOffset(Attribute layout, Location loc,
-                                     ConversionPatternRewriter &rewriter,
+                                     RewriterBase &rewriter,
                                      const TargetInfoBase &targetInfo,
                                      unsigned elemId, RankedTensorType type,
                                      ArrayRef<unsigned> multiDimCTAInRepId,
@@ -597,13 +836,188 @@ SmallVector<Value> getMultiDimOffset(Attribute layout, Location loc,
     multiDimOffset[1] = add(multiDimBase[1], i32_val(offsets[elemId][1]));
     return multiDimOffset;
   }
+  if (auto mmaLayout = mlir::dyn_cast<MthreadsWmmaEncodingAttr>(layout)) {
+    if (mmaLayout.isQY2()) {
+      assert(rank == 2 && "Unexpected rank");
+      auto shapePerCTA = getShapePerCTA(mmaLayout, shape);
+      auto instrShape = mmaLayout.getInstrShape();
+      SmallVector<Value> mmaColIdx(2);
+      SmallVector<Value> mmaRowIdx(4);
+      Value threadId = getThreadId(rewriter, loc);
+      auto threadsPerWarp = mmaLayout.getThreadsPerWarp();
+      Value warpSize = i32_val(product(threadsPerWarp));
+      Value laneId = urem(threadId, warpSize);
+      Value warpId = udiv(threadId, warpSize);
+      SmallVector<Value> multiDimWarpId(2);
+      auto warpsPerCTA = mmaLayout.getWarpsPerCTA();
+      auto warpOrder = triton::gpu::getWarpOrder(mmaLayout);
+      multiDimWarpId =
+          delinearize(rewriter, loc, warpId, warpsPerCTA, warpOrder);
+      Value _2 = i32_val(2);
+      Value _4 = i32_val(4);
+      Value _8 = i32_val(8);
+      Value _16 = i32_val(16);
+      Value _24 = i32_val(24);
+      Value _32 = i32_val(32);
+      Value _64 = i32_val(64);
+
+      multiDimWarpId[rank - 1] = urem(
+          multiDimWarpId[rank - 1],
+          i32_val(ceil<unsigned>(shapePerCTA[rank - 1], instrShape[rank - 1])));
+      multiDimWarpId[rank - 2] = urem(
+          multiDimWarpId[rank - 2],
+          i32_val(ceil<unsigned>(shapePerCTA[rank - 2], instrShape[rank - 2])));
+
+      Value mmaRowBaseStartId = mul(udiv(laneId, _64), _4);
+      Value mmaRowBaseOffsetId = urem(udiv(laneId, _8), _4);
+      Value mmaRowBaseId = add(mmaRowBaseStartId, mmaRowBaseOffsetId);
+      Value mmaColBaseStartId = mul(urem(udiv(laneId, _32), _2), _8);
+      Value mmaColBaseOffsetId = urem(laneId, _8);
+      Value mmaColBaseId = add(mmaColBaseStartId, mmaColBaseOffsetId);
+      Value mmaRow0 = mmaRowBaseId;
+      Value mmaRow1 = add(mmaRow0, _8);
+      Value mmaRow2 = add(mmaRow0, _16);
+      Value mmaRow3 = add(mmaRow0, _24);
+      Value mmaCol0 = mmaColBaseId;
+      Value mmaCol1 = add(mmaCol0, _16);
+      // Add warp offset
+      Value rowWarpOffset =
+          mul(multiDimWarpId[rank - 2], i32_val(instrShape[rank - 2]));
+      Value colWarpOffset =
+          mul(multiDimWarpId[rank - 1], i32_val(instrShape[rank - 1]));
+      mmaRowIdx[0] = add(mmaRow0, rowWarpOffset);
+      mmaRowIdx[1] = add(mmaRow1, rowWarpOffset);
+      mmaRowIdx[2] = add(mmaRow2, rowWarpOffset);
+      mmaRowIdx[3] = add(mmaRow3, rowWarpOffset);
+      mmaColIdx[0] = add(mmaCol0, colWarpOffset);
+      mmaColIdx[1] = add(mmaCol1, colWarpOffset);
+
+      SmallVector<Value> multiDimOffset(rank);
+      multiDimOffset[rank - 2] = mmaRowIdx[(elemId / 2) % 4]; // in mma
+      multiDimOffset[rank - 1] = mmaColIdx[elemId % 2];
+      multiDimOffset[rank - 2] =
+          add(multiDimOffset[rank - 2], i32_val(multiDimCTAInRepId[rank - 2] *
+                                                shapePerCTATile[rank - 2]));
+      multiDimOffset[rank - 1] =
+          add(multiDimOffset[rank - 1], i32_val(multiDimCTAInRepId[rank - 1] *
+                                                shapePerCTATile[rank - 1]));
+      return multiDimOffset;
+    } else if (mmaLayout.isPH1()) {
+      assert(rank == 2);
+
+      auto shapePerCTA = getShapePerCTA(mmaLayout, shape);
+      auto instrShape = mmaLayout.getInstrShape();
+
+      Value threadId = getThreadId(rewriter, loc);
+      Value warpSize = i32_val(32);
+      Value laneId = urem(threadId, warpSize);
+      Value warpId = udiv(threadId, warpSize);
+
+      SmallVector<Value> multiDimWarpId(2);
+      auto warpsPerCTA = mmaLayout.getWarpsPerCTA();
+      auto warpOrder = triton::gpu::getWarpOrder(mmaLayout);
+      multiDimWarpId =
+          delinearize(rewriter, loc, warpId, warpsPerCTA, warpOrder);
+
+      multiDimWarpId[1] =
+          urem(multiDimWarpId[1],
+               i32_val(ceil<unsigned>(shapePerCTA[1], instrShape[1])));
+      multiDimWarpId[0] =
+          urem(multiDimWarpId[0],
+               i32_val(ceil<unsigned>(shapePerCTA[0], instrShape[0])));
+
+      Value rowBase = udiv(laneId, i32_val(8));
+      Value colBase = urem(laneId, i32_val(8));
+
+      unsigned regN = elemId % (instrShape[1] / 8);
+      unsigned regM = elemId / (instrShape[1] / 8);
+      Value row = add(rowBase, i32_val(4 * regM));
+      Value col = add(colBase, i32_val(8 * regN));
+
+      row = add(row, mul(multiDimWarpId[0], i32_val(instrShape[0])));
+      col = add(col, mul(multiDimWarpId[1], i32_val(instrShape[1])));
+
+      row = add(row, i32_val(multiDimCTAInRepId[0] * shapePerCTATile[0]));
+      col = add(col, i32_val(multiDimCTAInRepId[1] * shapePerCTATile[1]));
+
+      SmallVector<Value> multiDimOffset(2);
+      multiDimOffset[0] = row;
+      multiDimOffset[1] = col;
+      return multiDimOffset;
+    }
+  }
+  if (auto mmaLayout = mlir::dyn_cast<MthreadsSqmmaEncodingAttr>(layout)) {
+    // assert(rank == 2 ||
+    //        (rank == 3 && mmaLayout.isAmpere()) && "Unexpected rank");
+    auto shapePerCTA = getShapePerCTA(mmaLayout, shape);
+    auto curInstrShape = mmaLayout.getInstrShape();
+    SmallVector<unsigned> baseInstrShape = {4, 8};
+    SmallVector<Value> mmaColIdx(2);
+    SmallVector<Value> mmaRowIdx(2);
+    Value threadId = getThreadId(rewriter, loc);
+    Value warpSize = i32_val(32);
+    Value laneId = urem(threadId, warpSize);
+    Value warpId = udiv(threadId, warpSize);
+    // TODO: fix the bug in MMAEncodingAttr document
+    SmallVector<Value> multiDimWarpId(2);
+    auto warpsPerCTA = mmaLayout.getWarpsPerCTA();
+    auto warpOrder = triton::gpu::getWarpOrder(mmaLayout);
+    multiDimWarpId = delinearize(rewriter, loc, warpId, warpsPerCTA, warpOrder);
+    Value _1 = i32_val(1);
+    Value _2 = i32_val(2);
+    Value _4 = i32_val(4);
+    Value _8 = i32_val(8);
+    Value _16 = i32_val(16);
+    if (mmaLayout.isPH1()) {
+      // There need a squad layer in dim M.
+      Value mmaSquadIdM = udiv(multiDimWarpId[rank - 2], _4);
+      Value mmaWarpIdInSquadM = urem(multiDimWarpId[rank - 2], _4);
+
+      Value mmaSquadSizeM = i32_val(curInstrShape[rank - 2] * 4);
+      Value mmaSquadOffsetM = mul(mmaSquadIdM, mmaSquadSizeM);
+      Value mmaWarpOffsetInSquadM =
+          mul(mmaWarpIdInSquadM, i32_val(baseInstrShape[rank - 2]));
+
+      Value mmaRowBaseId = udiv(laneId, _8);
+      Value mmaColBaseId = urem(laneId, _8);
+
+      mmaRowIdx[0] =
+          add(add(mmaRowBaseId, mmaWarpOffsetInSquadM), mmaSquadOffsetM);
+      Value colWarpOffset =
+          mul(multiDimWarpId[rank - 1], i32_val(curInstrShape[rank - 1]));
+      mmaColIdx[0] = add(mmaColBaseId, colWarpOffset);
+    } else {
+      llvm_unreachable("Unexpected MMALayout version");
+    }
+
+    SmallVector<Value> multiDimOffset(rank);
+    if (mmaLayout.isPH1()) {
+      unsigned numInstrRepN =
+          curInstrShape[rank - 1] / baseInstrShape[rank - 1];
+      unsigned instrRepIdM = elemId / numInstrRepN;
+      unsigned instrRepIdN = elemId % numInstrRepN;
+      multiDimOffset[0] = mmaRowIdx[0];
+      multiDimOffset[1] = mmaColIdx[0];
+      multiDimOffset[0] =
+          add(multiDimOffset[0],
+              i32_val((4 * baseInstrShape[rank - 2]) * instrRepIdM));
+      multiDimOffset[1] = add(multiDimOffset[1], i32_val(8 * instrRepIdN));
+      multiDimOffset[0] = add(multiDimOffset[0], i32_val(multiDimCTAInRepId[0] *
+                                                         shapePerCTATile[0]));
+      multiDimOffset[1] = add(multiDimOffset[1], i32_val(multiDimCTAInRepId[1] *
+                                                         shapePerCTATile[1]));
+    } else {
+      llvm_unreachable("Unexpected MMALayout version");
+    }
+    return multiDimOffset;
+  }
   llvm_unreachable("unexpected layout in getMultiDimOffset");
 }
 
 SmallVector<Value> getWrappedMultiDimOffset(
-    ConversionPatternRewriter &rewriter, Location loc,
-    ArrayRef<Value> multiDimOffset, ArrayRef<unsigned> shape,
-    SmallVector<unsigned> shapePerCTATile, SmallVector<int64_t> shapePerCTA) {
+    RewriterBase &rewriter, Location loc, ArrayRef<Value> multiDimOffset,
+    ArrayRef<unsigned> shape, SmallVector<unsigned> shapePerCTATile,
+    SmallVector<int64_t> shapePerCTA) {
   unsigned rank = shape.size();
   SmallVector<Value> multiDimOffsetWrapped(rank);
   for (unsigned d = 0; d < rank; ++d) {

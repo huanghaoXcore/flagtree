@@ -1,4 +1,8 @@
+#include <cstdint>
+
+#include "MMAUtil/Utility.h"
 #include "PatternTritonGPUOpToLLVM.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
@@ -19,8 +23,9 @@ using namespace mlir::triton;
 /// information.
 struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
   FuncOpConversion(LLVMTypeConverter &converter, int numWarps,
-                   PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(converter, benefit), numWarps(numWarps) {}
+                   int threadsPerWarp, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit), numWarps(numWarps),
+        threadsPerWarp(threadsPerWarp) {}
 
   /// Only retain those attributes that are not constructed by
   /// `LLVMFuncOp::build`. If `filterArgAttrs` is set, also filter out argument
@@ -68,10 +73,49 @@ struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     return amendedFuncOp;
   }
 
+  // Map the MLIR attribute `tt.mt_tma_desc` to the appropriate LLVM and NVVM
+  // attributes.
+  static void handleByvalTmaDescArgs(LLVM::LLVMFuncOp &llvmFuncOp) {
+    const bool isKernel = LLVM::isKernel(llvmFuncOp);
+    for (unsigned i = 0; i < llvmFuncOp.getNumArguments(); ++i) {
+      const auto attrs = llvmFuncOp.getArgAttrDict(i);
+      if (!attrs) {
+        continue;
+      }
+
+      for (const auto &attr : attrs) {
+        if (attr.getName() == "tt.mt_tma_desc") {
+          const auto i32_type =
+              mlir::IntegerType::get(llvmFuncOp.getContext(), 32);
+          assert(attr.getValue() == mlir::IntegerAttr::get(i32_type, 1));
+          assert(isKernel &&
+                 "tt.mt_tma_desc is not supported for device functions");
+
+          mlir::BlockArgument arg = llvmFuncOp.getArgument(i);
+          auto *ctx = llvmFuncOp.getContext();
+          const auto byteType = mlir::IntegerType::get(ctx, 8);
+          const auto arrayType =
+              mlir::LLVM::LLVMArrayType::get(ctx, byteType, 64);
+          // TODO: Support more by-value ArgType in backend
+          const auto structType = mlir::LLVM::LLVMStructType::getLiteral(
+              llvmFuncOp.getContext(), {arrayType}, /*isPacked=*/false);
+          llvmFuncOp.setArgAttr(i, "llvm.byval",
+                                mlir::TypeAttr::get(structType));
+          llvmFuncOp.setArgAttr(i, "mtgpu.grid_constant",
+                                mlir::UnitAttr::get(llvmFuncOp.getContext()));
+          llvmFuncOp.setArgAttr(i, "llvm.align",
+                                mlir::IntegerAttr::get(i32_type, 64));
+        }
+      }
+    }
+  }
+
   LogicalResult
   matchAndRewrite(triton::FuncOp funcOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Prevent LLVM's inliner to inline this function
+    auto maxBarAttr =
+        funcOp->getAttrOfType<IntegerAttr>(mlir::mma_util::kMaxBarIdAttr);
     auto amendedFuncOp = funcOp;
     if (!LLVM::isKernel(funcOp))
       amendedFuncOp = amendFuncOp(funcOp, rewriter);
@@ -83,6 +127,21 @@ struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     }
 
     auto ctx = funcOp->getContext();
+    if (maxBarAttr && LLVM::isKernel(funcOp)) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      auto &entryBlock = newFuncOp.getBody().front();
+      rewriter.setInsertionPointToStart(&entryBlock);
+      auto i32Ty = rewriter.getI32Type();
+      auto voidTy = LLVM::LLVMVoidType::get(ctx);
+      Value maxBarValue = rewriter.create<LLVM::ConstantOp>(
+          funcOp.getLoc(), i32Ty,
+          rewriter.getI32IntegerAttr(
+              static_cast<int32_t>(maxBarAttr.getInt())));
+      rewriter.create<LLVM::CallIntrinsicOp>(
+          funcOp.getLoc(), voidTy,
+          rewriter.getStringAttr("llvm.musa.async.bar.record"),
+          ValueRange{maxBarValue});
+    }
 
     if (LLVM::isKernel(funcOp)) {
       // Set an attribute to indicate this function is a kernel entry.
@@ -100,20 +159,23 @@ struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     }
     // Set an attribute for reqntidx, it could be used in latter LLVM codegen
     // for `nvvm.annotation` metadata.
-    newFuncOp->setAttr("mtgpu.maxntid",
-                       rewriter.getI32ArrayAttr(128 * numWarps));
+    newFuncOp->setAttr("mtgpu.maxntid", rewriter.getDenseI32ArrayAttr(
+                                            threadsPerWarp * numWarps));
     rewriter.eraseOp(funcOp);
+    handleByvalTmaDescArgs(newFuncOp);
     return success();
   }
 
 private:
   int numWarps{0};
+  int threadsPerWarp{0};
 };
 
 } // namespace
 
 void mlir::triton::MUSA::populateFuncOpConversionPattern(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns, int numWarps,
-    PatternBenefit benefit) {
-  patterns.add<FuncOpConversion>(typeConverter, numWarps, benefit);
+    int threadsPerWarp, PatternBenefit benefit) {
+  patterns.add<FuncOpConversion>(typeConverter, numWarps, threadsPerWarp,
+                                 benefit);
 }

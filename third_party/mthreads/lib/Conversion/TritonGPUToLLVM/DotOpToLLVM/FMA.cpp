@@ -27,20 +27,50 @@ getValueTableFromStructFMA(Value val, int K, int n0, int shapePerCTATile,
   return res;
 }
 
-static Value extendfp16Andbf16(Location loc, Value v,
-                               ConversionPatternRewriter &rewriter) {
-  if (v.getType() != f16_ty && v.getType() != bf16_ty)
+static Value extendOperandForFMA(Location loc, Value v,
+                                 ConversionPatternRewriter &rewriter) {
+  if (v.getType() == f32_ty)
     return v;
+
+  if (v.getType() == i8_ty) {
+    SmallVector<Value> ops = {v};
+    SmallVector<Type, 1> resultTypes{f16_ty};
+    auto intrinsic = LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.musa.e4m32f16.rn", resultTypes, ops);
+    Value f16Val = intrinsic.getResult(0);
+    return rewriter.create<LLVM::FPExtOp>(loc, f32_ty, f16Val);
+  }
+
   if (v.getType() == f16_ty)
     return rewriter.create<LLVM::FPExtOp>(loc, f32_ty, v);
+
   if (v.getType() == bf16_ty) {
     auto as_int16 = bitcast(v, i16_ty);
     auto as_int32 = zext(i32_ty, as_int16);
     auto shifted = shl(i32_ty, as_int32, i32_val(16));
     return bitcast(shifted, f32_ty);
   }
-  llvm_unreachable("unreachable");
-  return nullptr;
+
+  return v;
+}
+
+static Value restoreFMAResultType(Location loc, Value v, Type dstTy,
+                                  ConversionPatternRewriter &rewriter) {
+  if (v.getType() == dstTy || v.getType() != f32_ty)
+    return v;
+
+  if (dstTy == f16_ty)
+    return rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v);
+
+  if (dstTy == bf16_ty) {
+    SmallVector<Value> ops = {v};
+    SmallVector<Type, 1> resultTypes{bf16_ty};
+    auto intrinsic = LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.musa.float2bfloat16", resultTypes, ops);
+    return intrinsic.getResult(0);
+  }
+
+  return v;
 }
 
 LogicalResult convertFMADot(triton::DotOp op, triton::DotOp::Adaptor adaptor,
@@ -107,11 +137,21 @@ LogicalResult convertFMADot(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                         ? mIdx * N / nShapePerCTATile * mSizePerThread + nIdx
                         : nIdx * M / mShapePerCTATile * nSizePerThread + mIdx;
             // FIXME: ph1 support fp16 and bf16 fma, no need to convert
-            Value a = extendfp16Andbf16(loc, has[{m + mm, k}], rewriter);
-            Value b = extendfp16Andbf16(loc, hbs[{n + nn, k}], rewriter);
-            Value c = extendfp16Andbf16(loc, ret[z], rewriter);
+            Value a = extendOperandForFMA(loc, has[{m + mm, k}], rewriter);
+            Value b = extendOperandForFMA(loc, hbs[{n + nn, k}], rewriter);
+            Value c = extendOperandForFMA(loc, ret[z], rewriter);
             ret[z] = rewriter.create<LLVM::FMulAddOp>(loc, a, b, c);
           }
+  }
+
+  // TODO: Organize FMulAdd around the accumulator/result element type instead
+  // of always promoting f16/bf16 operands to f32 in this path. The current
+  // mtgpu lowering still computes in f32 here, so we must cast back before
+  // packLLElements materializes an f16/bf16 result struct.
+  Type dElemTy = dTensorTy.getElementType();
+  if (dElemTy.isF16() || dElemTy.isBF16()) {
+    for (Value &v : ret)
+      v = restoreFMAResultType(loc, v, dElemTy, rewriter);
   }
 
   auto res = packLLElements(loc, typeConverter, ret, rewriter, dTensorTy);

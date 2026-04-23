@@ -4,6 +4,7 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+#include "llvm/ADT/StringRef.h"
 
 using namespace mlir::triton::gpu;
 using namespace mlir::triton::MUSA;
@@ -78,10 +79,11 @@ struct FpToFpOpConversion
   static Value convertBf16ToFp32(Location loc,
                                  ConversionPatternRewriter &rewriter,
                                  const Value &v) {
-    auto as_int16 = bitcast(v, i16_ty);
-    auto as_int32 = zext(i32_ty, as_int16);
-    auto shifted = shl(i32_ty, as_int32, i32_val(16));
-    return bitcast(shifted, f32_ty);
+    SmallVector<Value> ops = {v};
+    SmallVector<Type, 1> resultTypes{f32_ty};
+    auto intrinsic = LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.musa.bfloat162float", resultTypes, ops);
+    return intrinsic.getResult(0);
   }
 
   static Value convertFp32ToBf16(Location loc,
@@ -94,34 +96,30 @@ struct FpToFpOpConversion
       return bitcast(truncated, bf16_ty);
     }
     // Otherwise it is (rounding == RoundingMode::RTNE)
-    auto as_uint32 = bitcast(v, i32_ty);
-    auto check_exponent =
-        and_(i32_ty, xor_(i32_ty, as_uint32, i32_val(0xffffffff)),
-             i32_val(0x7f800000));
-    auto exponent_not_all1s = icmp_ne(check_exponent, i32_val(0));
-    auto exponent_all1s = icmp_eq(check_exponent, i32_val(0));
-    auto rounded =
-        add(i32_ty, i32_val(0x7fff),
-            and_(i32_ty, lshr(i32_ty, as_uint32, i32_val(16)), i32_val(1)));
-    rounded = add(i32_ty, rounded, as_uint32);
-    auto res = select(exponent_not_all1s, rounded, as_uint32);
+    SmallVector<Value> ops = {v};
+    SmallVector<Type, 1> resultTypes{bf16_ty};
+    auto intrinsic = LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.musa.float2bfloat16", resultTypes, ops);
+    return intrinsic.getResult(0);
+  }
 
-    auto preserve_nan =
-        and_(i1_ty, exponent_all1s,
-             icmp_ne(and_(i32_ty, as_uint32, i32_val(0xffff)), i32_val(0)));
-    auto nan = or_(i32_ty, as_uint32, i32_val(0x10000));
-    res = select(preserve_nan, nan, res);
-
-    auto shifted = lshr(i32_ty, res, i32_val(16));
-    auto truncated = trunc(i16_ty, shifted);
-    return bitcast(truncated, bf16_ty);
+  static Value convertFp32ToFp16(Location loc,
+                                 ConversionPatternRewriter &rewriter,
+                                 const Value &v, const RoundingMode rounding) {
+    SmallVector<Value> ops = {v};
+    SmallVector<Type, 1> resultTypes{f16_ty};
+    StringRef intrinsic =
+        rounding == RoundingMode::RTZ ? "llvm.musa.f2h.rz" : "llvm.musa.f2h.rn";
+    auto intrinsicOp = LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic,
+                                                       resultTypes, ops);
+    return intrinsicOp.getResult(0);
   }
 
   std::pair<std::string, size_t>
   getConversionFunc(Type srcTy, Type dstTy,
                     std::optional<RoundingMode> roundingMode,
                     bool enableFp8Burst2) const {
-    auto F8E4M3TyID = TypeID::get<Float8E4M3FNUZType>();
+    auto F8E4M3TyID = TypeID::get<Float8E4M3FNType>();
     auto F8E5M2TyID = TypeID::get<Float8E5M2Type>();
     auto F16TyID = TypeID::get<Float16Type>();
     auto BF16TyID = TypeID::get<BFloat16Type>();
@@ -191,37 +189,33 @@ struct FpToFpOpConversion
     auto roundingMode = op.getRounding();
 
     bool isFp8Converion =
-        srcElementType.isFloat8E4M3FNUZ() || srcElementType.isFloat8E5M2() ||
-        dstElementType.isFloat8E4M3FNUZ() || dstElementType.isFloat8E5M2();
-    assert(isFp8Converion &&
-           "For now only Fp8 conversions are supported for the op FpToFp.");
-
-    if (dstElementType.isFloat8E5M2() || dstElementType.isFloat8E4M3FNUZ()) {
-      assert(roundingMode.has_value() &&
-             "Rounding mode must be specified for convertsions to fp8");
-
-      // For now only RTNE is supported for all conversions
-      if (roundingMode.value() != RoundingMode::RTNE) {
-        llvm::errs() << "Unsupported rounding mode for conversion to fp8: "
-                     << stringifyRoundingMode(roundingMode.value()) << "\n";
-        llvm_unreachable("");
-      }
-    }
-
-    // Default disable fp8 burst2
-    bool enableFp8Burst2 = false;
-    std::string envValue =
-        mlir::triton::tools::getStrEnv("MUSA_ENABLE_FP8_BURST2");
-    if (!envValue.empty() &&
-        (envValue == "true" || envValue == "TRUE" || envValue == "1")) {
-      enableFp8Burst2 = true;
-    }
-
-    auto [funcName, numElements] = getConversionFunc(
-        srcElementType, dstElementType, roundingMode, enableFp8Burst2);
-
-    // FP8 conversions
+        srcElementType.isFloat8E4M3FN() || srcElementType.isFloat8E5M2() ||
+        dstElementType.isFloat8E4M3FN() || dstElementType.isFloat8E5M2();
     if (isFp8Converion) {
+      if (dstElementType.isFloat8E5M2() || dstElementType.isFloat8E4M3FN()) {
+        assert(roundingMode.has_value() &&
+               "Rounding mode must be specified for convertsions to fp8");
+
+        // For now only RTNE is supported for all conversions
+        if (roundingMode.value() != RoundingMode::RTNE) {
+          llvm::errs() << "Unsupported rounding mode for conversion to fp8: "
+                       << stringifyRoundingMode(roundingMode.value()) << "\n";
+          llvm_unreachable("");
+        }
+      }
+
+      // Default disable fp8 burst2
+      bool enableFp8Burst2 = false;
+      std::string envValue =
+          mlir::triton::tools::getStrEnv("MUSA_ENABLE_FP8_BURST2");
+      if (!envValue.empty() &&
+          (envValue == "true" || envValue == "TRUE" || envValue == "1")) {
+        enableFp8Burst2 = true;
+      }
+
+      auto [funcName, numElements] = getConversionFunc(
+          srcElementType, dstElementType, roundingMode, enableFp8Burst2);
+
       SmallVector<Value> inVals;
       for (unsigned i = 0; i < std::min(numElements, operands.size()); i++) {
         inVals.push_back(operands[i][0]);
@@ -233,8 +227,48 @@ struct FpToFpOpConversion
                      dstElementType, funcName);
       return outVals;
     }
-    llvm_unreachable("Unsupported conversion");
-    return {};
+
+    // Non-fp8 conversions.
+    auto input = operands[0][0];
+    if (srcElementType.isBF16() && dstElementType.isF32()) {
+      return {convertBf16ToFp32(loc, rewriter, input)};
+    }
+
+    if (srcElementType.isF32() && dstElementType.isBF16()) {
+      assert(roundingMode.has_value() &&
+             "Rounding mode must be specified for fp32->bf16 conversion");
+      return {convertFp32ToBf16(loc, rewriter, input, roundingMode.value())};
+    }
+
+    if (srcElementType.isF16() && dstElementType.isF32()) {
+      return {rewriter.create<LLVM::FPExtOp>(loc, elemTy, input)};
+    }
+
+    if (srcElementType.isF32() && dstElementType.isF16()) {
+      assert(roundingMode.has_value() &&
+             "Rounding mode must be specified for fp32->fp16 conversion");
+      return {convertFp32ToFp16(loc, rewriter, input, roundingMode.value())};
+    }
+
+    if (srcElementType.isF16() && dstElementType.isBF16()) {
+      auto tmp = rewriter.create<LLVM::FPExtOp>(loc, f32_ty, input);
+      auto rm = roundingMode.value_or(RoundingMode::RTNE);
+      return {convertFp32ToBf16(loc, rewriter, tmp, rm)};
+    }
+
+    if (srcElementType.isBF16() && dstElementType.isF16()) {
+      auto tmp = convertBf16ToFp32(loc, rewriter, input);
+      auto rm = roundingMode.value_or(RoundingMode::RTNE);
+      return {rewriter.create<LLVM::FPTruncOp>(loc, elemTy, tmp)};
+    }
+
+    if (srcElementType == dstElementType) {
+      return {input};
+    }
+
+    llvm::errs() << "Unsupported non-fp8 conversion from " << srcElementType
+                 << " to " << dstElementType << "\n";
+    llvm_unreachable("");
   }
 
 private:
@@ -508,21 +542,44 @@ struct ClampFOpConversion
     return patternFound;
   }
 
-  SmallVector<Value> emitOptimization(ClampFOp op,
-                                      ConversionPatternRewriter &rewriter,
-                                      Type elemTy,
-                                      MultipleOperandsRange operands,
-                                      Location loc) const {
-    llvm_unreachable("This function is not implemented yet.");
-    return {};
-  }
+  // SmallVector<Value> emitOptimization(ClampFOp op,
+  //                                     ConversionPatternRewriter &rewriter,
+  //                                     Type elemTy,
+  //                                     MultipleOperandsRange operands,
+  //                                     Location loc) const {
+  //   // min.xorsign.abs
+  //   PTXBuilder ptxBuilder;
+  //   bool propNan = (op.getPropagateNan() == PropagateNan::ALL);
+  //   auto &minXorsign = ptxBuilder.create<PTXInstr>("min")
+  //                          ->o("NaN", propNan)
+  //                          .o("xorsign")
+  //                          .o("abs");
+  //   const char *outType = nullptr;
+  //   const char *inType = nullptr;
+  //   if (elemTy.isF32()) {
+  //     minXorsign.o("f32");
+  //     outType = "=f";
+  //     inType = "f";
+  //   } else if (elemTy.isF16()) {
+  //     minXorsign.o("f16");
+  //     outType = "=h";
+  //     inType = "h";
+  //   }
+  //   auto output = ptxBuilder.newOperand(outType);
+  //   auto inputA = ptxBuilder.newOperand(operands[0][0], inType);
+  //   auto inputB = ptxBuilder.newOperand(operands[0][2], inType);
+  //   minXorsign(output, inputA, inputB);
+
+  //   return {ptxBuilder.launch(rewriter, loc, elemTy, false)};
+  // }
 
   SmallVector<Value> createDestOps(ClampFOp op, OpAdaptor adaptor,
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
     if (isClipPattern(op)) {
-      return emitOptimization(op, rewriter, elemTy, operands, loc);
+      assert(0 && "unreachable emitOptimization in createDestOps");
+      // return emitOptimization(op, rewriter, elemTy, operands, loc);
     }
     return {};
   }
@@ -562,6 +619,86 @@ struct OpToExternCallConversion
 private:
   StringRef funcName;
 };
+
+// Custom conversion for PreciseSqrtOp that uses f64 sqrt for better precision
+struct PreciseSqrtOpConversion
+    : public ElementwiseOpConversionBase<triton::PreciseSqrtOp,
+                                         PreciseSqrtOpConversion> {
+  using Base = ElementwiseOpConversionBase<triton::PreciseSqrtOp,
+                                           PreciseSqrtOpConversion>;
+  using Base::Base;
+  using Adaptor = typename Base::OpAdaptor;
+
+  explicit PreciseSqrtOpConversion(LLVMTypeConverter &typeConverter,
+                                   ModuleAxisInfoAnalysis &axisAnalysisPass,
+                                   PatternBenefit benefit)
+      : Base::ElementwiseOpConversionBase(typeConverter, axisAnalysisPass,
+                                          benefit) {}
+
+  SmallVector<Value> createDestOps(triton::PreciseSqrtOp op, Adaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    // For f32 input, promote to f64, compute sqrt in f64, then truncate back to
+    // f32 This provides higher precision than native f32 sqrt
+    Type f64Ty = rewriter.getF64Type();
+    Type f32Ty = rewriter.getF32Type();
+
+    Value input = operands[0][0];
+    Value inputF64 = rewriter.create<LLVM::FPExtOp>(loc, f64Ty, input);
+
+    Type funcType = getFunctionType(f64Ty, ValueRange({inputF64}));
+    LLVM::LLVMFuncOp funcOp =
+        appendOrGetExternFuncOp(rewriter, op, "__mt_sqrt_f64", funcType);
+    Value sqrtResultF64 =
+        rewriter.create<LLVM::CallOp>(loc, funcOp, ValueRange({inputF64}))
+            .getResult();
+
+    Value resultF32 =
+        rewriter.create<LLVM::FPTruncOp>(loc, f32Ty, sqrtResultF64);
+
+    return {resultF32};
+  }
+};
+
+// Custom conversion for PreciseDivFOp that uses f64 div for better precision
+struct PreciseDivOpConversion
+    : public ElementwiseOpConversionBase<triton::PreciseDivFOp,
+                                         PreciseDivOpConversion> {
+  using Base = ElementwiseOpConversionBase<triton::PreciseDivFOp,
+                                           PreciseDivOpConversion>;
+  using Base::Base;
+  using Adaptor = typename Base::OpAdaptor;
+
+  explicit PreciseDivOpConversion(LLVMTypeConverter &typeConverter,
+                                  ModuleAxisInfoAnalysis &axisAnalysisPass,
+                                  PatternBenefit benefit)
+      : Base::ElementwiseOpConversionBase(typeConverter, axisAnalysisPass,
+                                          benefit) {}
+
+  SmallVector<Value> createDestOps(triton::PreciseDivFOp op, Adaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    // For f32 inputs, promote to f64, compute div in f64, then truncate back to
+    // f32 This provides higher precision than native f32 div
+    Type f64Ty = rewriter.getF64Type();
+    Type f32Ty = rewriter.getF32Type();
+
+    Value lhs = operands[0][0];
+    Value rhs = operands[0][1];
+
+    Value lhsF64 = rewriter.create<LLVM::FPExtOp>(loc, f64Ty, lhs);
+    Value rhsF64 = rewriter.create<LLVM::FPExtOp>(loc, f64Ty, rhs);
+    Value divResultF64 =
+        rewriter.create<LLVM::FDivOp>(loc, f64Ty, lhsF64, rhsF64);
+    Value resultF32 =
+        rewriter.create<LLVM::FPTruncOp>(loc, f32Ty, divResultF64);
+
+    return {resultF32};
+  }
+};
+
 } // namespace
 } // namespace gpu
 
@@ -573,10 +710,11 @@ void mlir::triton::MUSA::populateElementwiseOpToLLVMPatterns(
     const TargetInfo &targetInfo, PatternBenefit benefit) {
   using namespace mlir::triton::gpu;
 
-  patterns.add<OpToExternCallConversion<triton::PreciseSqrtOp>>(
-      typeConverter, axisInfoAnalysis, "__nv_fsqrt_rn", benefit);
-  patterns.add<OpToExternCallConversion<triton::PreciseDivFOp>>(
-      typeConverter, axisInfoAnalysis, "__nv_fdiv_rn", benefit);
+  // Use f64 type for better precision: f32 -> f64 -> sqrt/div -> f32
+  patterns.add<PreciseSqrtOpConversion>(typeConverter, axisInfoAnalysis,
+                                        benefit);
+  patterns.add<PreciseDivOpConversion>(typeConverter, axisInfoAnalysis,
+                                       benefit);
 
   mlir::triton::populateElementwiseOpToLLVMPatterns(
       typeConverter, patterns, axisInfoAnalysis, targetInfo, benefit);
@@ -588,12 +726,10 @@ void mlir::triton::MUSA::populateElementwiseOpToLLVMPatterns(
 
   patterns.add<ExtFOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<TruncFOpConversion>(typeConverter, axisInfoAnalysis, benefit);
-  patterns.add<FPToSIOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<SIToFPOpConversion>(typeConverter, axisInfoAnalysis, benefit);
-
   patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis,
                                    computeCapability, benefit);
-
+  patterns.add<FPToSIOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   // ExpOpConversionApprox will try using ex2.approx if the input type is
   // FP32. For other input types, ExpOpConversionApprox will return failure and
   // ElementwiseOpConversion<math::ExpOp, math::ExpOp> defined below will call

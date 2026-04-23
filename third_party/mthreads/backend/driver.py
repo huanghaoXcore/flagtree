@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import sysconfig
 from pathlib import Path
+from triton.runtime.build import _build
 from triton.runtime.cache import get_cache_manager
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import GPUDriver
@@ -60,7 +61,6 @@ def _build(name, src, srcdir):
         cc, src, "-O3", f"-I{mu_include_dir}", f"-I{py_include_dir}", f"-I{srcdir}", "-shared", "-fPIC",
         f"-L{musa_lib_dir}", "-lmusa", "-o", so
     ]
-    # cc_cmd += [f"-L{dir}" for dir in musa_lib_dir]
     ret = subprocess.check_call(cc_cmd)
 
     if ret == 0:
@@ -140,6 +140,9 @@ class MusaUtils(object):
         mod = compile_module_from_src(Path(os.path.join(dirname, "driver.c")).read_text(), "musa_utils")
         self.load_binary = mod.load_binary
         self.get_device_properties = mod.get_device_properties
+        self.fill_1d_tma_descriptor = mod.fill_1d_tma_descriptor
+        self.fill_2d_tma_descriptor = mod.fill_2d_tma_descriptor
+        self.fill_3d_tma_descriptor = mod.fill_3d_tma_descriptor
 
 
 # ------------------------
@@ -151,18 +154,9 @@ def ty_to_cpp(ty):
     if ty[0] == '*':
         return "MUdeviceptr"
     return {
-        "i1": "int32_t",
-        "i8": "int8_t",
-        "i16": "int16_t",
-        "i32": "int32_t",
-        "i64": "int64_t",
-        "u32": "uint32_t",
-        "u64": "uint64_t",
-        "fp16": "float",
-        "bf16": "float",
-        "fp32": "float",
-        "f32": "float",
-        "fp64": "double",
+        "i1": "int32_t", "i8": "int8_t", "i16": "int16_t", "i32": "int32_t", "i64": "int64_t", "u1": "uint32_t", "u8":
+        "uint8_t", "u16": "uint16_t", "u32": "uint32_t", "u64": "uint64_t", "fp16": "float", "bf16": "float", "fp32":
+        "float", "f32": "float", "fp64": "double", "mtTmaDesc": "MUtensorDescriptor"
     }[ty]
 
 
@@ -174,6 +168,9 @@ def make_launcher(constants, signature, ids, warp_size):
     def _extracted_type(ty):
         if ty[0] == '*':
             return "PyObject*"
+        if ty == "mtTmaDesc":
+            return "PyObject*"
+
         return ty_to_cpp(ty)
 
     def format_of(ty):
@@ -182,15 +179,29 @@ def make_launcher(constants, signature, ids, warp_size):
             "float": "f",
             "double": "d",
             "long": "l",
-            "uint32_t": "I",
+            "int8_t": "b",
+            "int16_t": "h",
             "int32_t": "i",
-            "uint64_t": "K",
             "int64_t": "L",
+            "uint8_t": "B",
+            "uint16_t": "H",
+            "uint32_t": "I",
+            "uint64_t": "K",
         }[ty]
 
     args_format = ''.join([format_of(_extracted_type(ty)) for ty in signature.values()])
     format = "iiiKKOOOO" + args_format
     args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
+
+    internal_args_list = []
+    for i, ty in signature.items():
+        if ty[0] == "*":
+            internal_args_list.append(f"ptr_info{i}.dev_ptr")
+        elif ty == "mtTmaDesc":
+            # Note: we have to dereference the pointer
+            internal_args_list.append(f"*tma_ptr{i}")
+        else:
+            internal_args_list.append(f"_arg{i}")
 
     # generate glue code
     params = [i for i in signature.keys() if i not in constants]
@@ -204,7 +215,7 @@ static inline void gpuAssert(MUresult code, const char *file, int line)
 {{
    if (code != MUSA_SUCCESS)
    {{
-      const char* prefix = "Triton Error [CUDA]: ";
+      const char* prefix = "Triton Error [MUSA]: ";
       const char* str;
       muGetErrorString(code, &str);
       char err[1024] = {{0}};
@@ -310,9 +321,12 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
         PyErr_Format(PyExc_ValueError,
                      "Pointer argument (at %d) cannot be accessed from Triton (cpu tensor?)", idx);
         ptr_info.valid = false;
+    }} else if (status != MUSA_SUCCESS) {{
+        MUSA_CHECK(MUresult(status));  // Catch any other musa API errors
+        ptr_info.valid = false;
     }}
     ptr_info.dev_ptr = dev_ptr;
-    Py_DECREF(ret);  // Thanks ChatGPT!
+    Py_DECREF(ret);
     return ptr_info;
   }}
   PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
@@ -320,7 +334,68 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
   return ptr_info;
 }}
 
+static void ensureMusaContext() {{
+  MUcontext pctx;
+  MUSA_CHECK(muCtxGetCurrent(&pctx));
+  if (!pctx) {{
+    // Ensure device context.
+    MUdevice device;
+    MUSA_CHECK(muDeviceGet(&device, 0));
+    MUSA_CHECK(muDevicePrimaryCtxRetain(&pctx, device));
+    MUSA_CHECK(muCtxSetCurrent(pctx));
+  }}
+}}
+
+static inline MUtensorDescriptor* getTmaDesc(PyObject *obj) {{
+  if (sizeof(MUtensorDescriptor*) != 8) {{
+    PyErr_SetString(PyExc_SystemError, "getTmaDesc() requires 64-bit compilation");
+    return NULL;
+  }}
+
+  PyObject *method_handle = PyObject_GetAttrString(obj, "tma_desc_cpu_ptr");
+  if (!method_handle) {{
+    PyErr_SetString(PyExc_TypeError, "tma_desc_cpu_ptr() method does not exist");
+    return NULL;
+  }}
+
+  PyObject *empty_tuple = PyTuple_New(0);
+  if (!empty_tuple) {{
+    Py_DECREF(method_handle);
+    PyErr_SetString(PyExc_SystemError, "Internal Python error!");
+    return NULL;
+  }}
+  PyObject *method_ret = PyObject_Call(method_handle, empty_tuple, NULL);
+  Py_DECREF(empty_tuple);
+  Py_DECREF(method_handle);
+  if (!method_ret) {{
+    PyErr_SetString(PyExc_SystemError, "Internal Python error!");
+    return NULL;
+  }}
+
+  if (!PyLong_Check(method_ret)) {{
+    PyErr_SetString(PyExc_TypeError, "tma_desc_cpu_ptr() must return 64-bit int");
+    Py_DECREF(method_ret);
+    return NULL;
+  }}
+
+  uint64_t ptr_as_uint = PyLong_AsUnsignedLongLong(method_ret);
+  Py_DECREF(method_ret);
+  if (!ptr_as_uint) {{
+    PyErr_SetString(PyExc_ValueError, "received NULL ptr from tma_desc_cpu_ptr()");
+    return NULL;
+  }}
+  if (ptr_as_uint % 64 != 0) {{
+    PyErr_SetString(PyExc_ValueError, "tma_desc_cpu_ptr() must be 64-byte aligned");
+    return NULL;
+  }}
+
+  return (MUtensorDescriptor*)(ptr_as_uint);
+}}
+
 static PyObject* launch(PyObject* self, PyObject* args) {{
+  // ensure musa context is valid before calling any MUSA APIs, e.g. before getPointer calls muPointerGetAttributes
+  ensureMusaContext();
+
   int gridX, gridY, gridZ;
   uint64_t _stream;
   uint64_t _function;
@@ -351,9 +426,11 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   }}
 
   // raise exception asap
-  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"".join([f"MUtensorDescriptor* tma_ptr{i} = getTmaDesc(_arg{i}); if (!tma_ptr{i}) return NULL;" if ty == "mtTmaDesc" else "" for i, ty in signature.items()])};
   Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (MUstream)_stream, (MUfunction)_function{', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items()) if len(signature) > 0 else ''});
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (MUstream)_stream, (MUfunction)_function{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
+
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
     return NULL;
@@ -426,27 +503,59 @@ class MusaDriver(GPUDriver):
         self.get_current_device = self._get_current_device
         self.set_current_device = self._set_current_device
 
+    def get_current_target(self):
+        device = self.get_current_device()
+        capability = self.get_device_capability(device)
+        capability = capability[0] * 10 + capability[1]
+        warp_size = 32
+        return GPUTarget("musa", capability, warp_size)
+
+    def get_device_interface(self):
+        import torch
+        return torch.musa
+
+    @staticmethod
+    def is_active():
+        import torch
+        return torch.musa.is_available()
+
+    def get_benchmarker(self):
+        from triton.testing import do_bench
+        return do_bench
+
+    def get_empty_cache_for_benchmark(self):
+        import torch
+
+        # We maintain a buffer of 256 MB that we clear
+        # before each kernel call to make sure that the L2 cache
+        # doesn't contain any input data before the run
+        cache_size = 256 * 1024 * 1024
+        return torch.empty(int(cache_size // 4), dtype=torch.int, device='musa')
+
     def _get_device_capability(self, device):
-        return torch_musa.get_device_capability(device)
+        import torch
+        return torch.musa.get_device_capability(device)
 
     def _get_current_stream(self, idx):
+        import torch
         try:
-            # return torch_musa._MUSAC._musa_getCurrentStream(idx)
-            return torch_musa._MUSAC._musa_getCurrentRawStream(idx)
+            return torch.musa._MUSAC._musa_getCurrentRawStream(idx)
         except ImportError:
-            return torch_musa.current_stream(idx).musa_stream
+            return torch.musa.current_stream(idx).musa_stream
 
     def _get_current_device(self):
         """
         Get current device
         """
-        return torch_musa.current_device()
+        import torch
+        return torch.musa.current_device()
 
     def _set_current_device(self, device):
         """
         Set current device as the given device
         """
-        torch_musa.set_device(device)
+        import torch
+        torch.musa.set_device(device)
 
     def get_current_target(self):
         device = self.get_current_device()
@@ -455,18 +564,6 @@ class MusaDriver(GPUDriver):
         if capability[0] > 2:
             warp_size = 32
         capability = capability[0] * 10 + capability[1]
+        # QY2  22
+        # PH1  31
         return GPUTarget("musa", capability, warp_size)
-
-    @staticmethod
-    def is_active():
-        try:
-            import torch
-            import torch_musa
-            return torch.musa.is_available()
-        except:
-            return False
-
-
-if MusaDriver.is_active():
-    import torch
-    import torch_musa

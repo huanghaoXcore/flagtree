@@ -2,6 +2,20 @@ get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
 
+set(mthreads_plugin_link_libs)
+if (NOT FLAGTREE_PLUGIN)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/plugin/include)
+  include_directories(${CMAKE_CURRENT_BINARY_DIR}/plugin/include)
+  find_library(mthreadsTritonPluginLib
+    NAMES
+      mthreadsTritonPluginLib.so
+    PATHS
+      ${MTHREADS_PLUGIN_DIR}
+    REQUIRED
+  )
+  list(APPEND mthreads_plugin_link_libs ${mthreadsTritonPluginLib})
+endif()
+
 add_llvm_executable(triton-opt triton-opt.cpp PARTIAL_SOURCES_INTENDED)
 
 # TODO: what's this?
@@ -11,7 +25,7 @@ target_link_libraries(triton-opt PRIVATE
   TritonAnalysis
   TritonTransforms
   TritonGPUTransforms
-  MLIRGPUToROCDLTransforms
+  ${mthreadsTritonPluginLib}
   ${dialect_libs}
   ${conversion_libs}
   ${triton_libs}
@@ -35,6 +49,7 @@ target_link_libraries(triton-reduce PRIVATE
   TritonAnalysis
   TritonTransforms
   TritonGPUTransforms
+  ${mthreadsTritonPluginLib}
   ${dialect_libs}
   ${conversion_libs}
   ${triton_libs}
@@ -57,6 +72,7 @@ target_link_libraries(triton-lsp PRIVATE
   TritonAnalysis
   TritonTransforms
   TritonGPUTransforms
+  ${mthreadsTritonPluginLib}
   ${dialect_libs}
   ${conversion_libs}
   ${triton_libs}
@@ -79,7 +95,7 @@ add_llvm_executable(triton-llvm-opt
   DEPENDS
   intrinsics_gen
   SUPPORT_PLUGINS
-  )
+)
 target_link_libraries(triton-llvm-opt PRIVATE
   TritonLLVMIR
 
@@ -88,7 +104,8 @@ target_link_libraries(triton-llvm-opt PRIVATE
   LLVMSupport
   LLVMOption
   LLVMCodeGen
-  )
+  ${mthreadsTritonPluginLib}
+)
 export_executable_symbols_for_plugins(triton-llvm-opt)
 set_target_properties(triton-llvm-opt PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/

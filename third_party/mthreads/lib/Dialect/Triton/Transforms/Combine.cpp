@@ -113,8 +113,7 @@ public:
     Value falseValue = selectOp.getFalseValue();
     Value condSelect = selectOp.getCondition();
 
-    auto *loadOpCandidate = trueValue.getDefiningOp();
-    auto loadOp = llvm::dyn_cast_or_null<LoadOp>(loadOpCandidate);
+    auto loadOp = trueValue.getDefiningOp<LoadOp>();
     if (!loadOp)
       return failure();
 
@@ -122,8 +121,7 @@ public:
     if (!mask)
       return failure();
 
-    auto *splatOpCandidate = mask.getDefiningOp();
-    auto splatOp = llvm::dyn_cast_or_null<SplatOp>(splatOpCandidate);
+    auto splatOp = mask.getDefiningOp<SplatOp>();
     if (!splatOp)
       return failure();
 
@@ -175,26 +173,21 @@ public:
     if (!isReduceAdd)
       return failure();
     // operand of reduce has to be mul
-    auto mulOp = llvm::dyn_cast_or_null<arith::MulFOp>(
-        reduceOp.getOperand(0).getDefiningOp());
+    auto mulOp = reduceOp.getOperand(0).getDefiningOp<arith::MulFOp>();
     if (!mulOp)
       return failure();
     // mul operand has to be broadcast
-    auto broadcastLhsOp = llvm::dyn_cast_or_null<BroadcastOp>(
-        mulOp.getOperand(0).getDefiningOp());
+    auto broadcastLhsOp = mulOp.getOperand(0).getDefiningOp<BroadcastOp>();
     if (!broadcastLhsOp)
       return failure();
-    auto broadcastRhsOp = llvm::dyn_cast_or_null<BroadcastOp>(
-        mulOp.getOperand(1).getDefiningOp());
+    auto broadcastRhsOp = mulOp.getOperand(1).getDefiningOp<BroadcastOp>();
     if (!broadcastRhsOp)
       return failure();
     // broadcast operand is expand dims
-    auto expandLhsOp = llvm::dyn_cast_or_null<ExpandDimsOp>(
-        broadcastLhsOp.getSrc().getDefiningOp());
+    auto expandLhsOp = broadcastLhsOp.getSrc().getDefiningOp<ExpandDimsOp>();
     if (!expandLhsOp)
       return failure();
-    auto expandRhsOp = llvm::dyn_cast_or_null<ExpandDimsOp>(
-        broadcastRhsOp.getSrc().getDefiningOp());
+    auto expandRhsOp = broadcastRhsOp.getSrc().getDefiningOp<ExpandDimsOp>();
     if (!expandRhsOp)
       return failure();
     // get not-broadcast dimensions
@@ -223,6 +216,37 @@ public:
   }
 };
 
+class RankedReduceDescriptorLoads : public mlir::OpRewritePattern<ReshapeOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(triton::ReshapeOp reshapeOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto loadDef = reshapeOp.getSrc()
+                       .getDefiningOp<triton::ExperimentalDescriptorLoadOp>();
+    if (!loadDef || !loadDef->hasOneUse())
+      return failure();
+    int loadRank = loadDef.getType().getRank();
+    int reshapeRank = reshapeOp.getType().getRank();
+    if (!(reshapeRank < loadRank))
+      return failure();
+    ArrayRef<int64_t> loadShape = loadDef.getType().getShape();
+    ArrayRef<int64_t> reshapeShape = reshapeOp.getType().getShape();
+    for (int i = 0; i < loadRank - reshapeRank; ++i) {
+      // Only rank reduce unit dims.
+      if (loadShape[i] != 1)
+        return failure();
+    }
+    if (loadShape.take_back(reshapeRank) != reshapeShape)
+      return failure();
+    rewriter.modifyOpInPlace(
+        loadDef, [&]() { loadDef.getResult().setType(reshapeOp.getType()); });
+    rewriter.replaceOp(reshapeOp, loadDef.getResult());
+    return success();
+  }
+};
+
 class CombineOpsPass : public TritonCombineOpsBase<CombineOpsPass> {
 public:
   void runOnOperation() override {
@@ -240,6 +264,7 @@ public:
     patterns.add<CombineAddPtrPattern>(context);
     patterns.add<CombineBroadcastConstantPattern>(context);
     patterns.add<CombineBroadcastMulReducePattern>(context);
+    patterns.add<RankedReduceDescriptorLoads>(context);
 
     if (applyPatternsAndFoldGreedily(m, std::move(patterns)).failed())
       signalPassFailure();

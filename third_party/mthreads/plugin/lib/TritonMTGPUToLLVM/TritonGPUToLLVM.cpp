@@ -1,5 +1,6 @@
+#include "Dialect/MTGPU/IR/Dialect.h"
+#include "Dialect/TritonMthreadsGPU/IR/Dialect.h"
 #include "TritonMTGPUToLLVM/Passes.h"
-#include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/GPUToMTGPU/GPUToMTGPUPass.h"
@@ -7,10 +8,9 @@
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
-#include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/MTGPUDialect.h"
 #include "mlir/Pass/Pass.h"
@@ -38,6 +38,42 @@ using namespace mlir::triton::MUSA;
 
 namespace {
 
+// Remove redundant bf16->fp32 conversion pairs emitted by elementwise lowering:
+// if a value is converted to bf16 and is immediately converted back to fp32
+// without any other uses, the round-trip adds unnecessary quantization noise.
+// Folding the pair keeps the computation in fp32 until a real bf16 consumer.
+struct CancelRedundantBFloatRoundTripPattern
+    : public mlir::OpRewritePattern<LLVM::CallIntrinsicOp> {
+  using mlir::OpRewritePattern<LLVM::CallIntrinsicOp>::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(LLVM::CallIntrinsicOp call,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto intrin = call.getIntrinAttr().getValue();
+    if (intrin != "llvm.musa.bfloat162float")
+      return rewriter.notifyMatchFailure(call, "not musa bf16->fp32 intrinsic");
+    if (call.getNumOperands() != 1)
+      return rewriter.notifyMatchFailure(call, "unexpected operand count");
+
+    auto producerCall =
+        call.getOperand(0).getDefiningOp<LLVM::CallIntrinsicOp>();
+    if (!producerCall)
+      return rewriter.notifyMatchFailure(call,
+                                         "producer is not call_intrinsic op");
+    auto producerIntrin = producerCall.getIntrinAttr().getValue();
+    if (producerIntrin != "llvm.musa.float2bfloat16")
+      return rewriter.notifyMatchFailure(
+          call, "producer is not fp32->bf16 intrinsic");
+    if (!producerCall->hasOneUse())
+      return rewriter.notifyMatchFailure(call,
+                                         "round-trip result has multiple uses");
+
+    rewriter.replaceOp(call, producerCall.getOperand(0));
+    rewriter.eraseOp(producerCall);
+    return mlir::success();
+  }
+};
+
 // pass ws related named attrs.
 static void addAttrs(Operation *op, ArrayRef<mlir::NamedAttribute> attrs) {
   for (const NamedAttribute attr : attrs)
@@ -61,10 +97,12 @@ public:
       : ConversionTarget(ctx) {
     addLegalDialect<LLVM::LLVMDialect>();
     addLegalDialect<mlir::MTGPU::MTGPUDialect>();
+    addLegalDialect<mlir::triton::mtgpu::MTGPUDialect>();
     addLegalDialect<mlir::scf::SCFDialect>();
     addIllegalDialect<triton::TritonDialect>();
     addIllegalDialect<triton::gpu::TritonGPUDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
+    addIllegalDialect<triton::mthreads_gpu::TritonMthreadsGPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
   }
 };
@@ -75,7 +113,8 @@ struct ConvertTritonMTGPUToLLVM
   using ConvertTritonMTGPUToLLVMBase::ConvertTritonMTGPUToLLVMBase;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<LLVM::LLVMDialect, mlir::MTGPU::MTGPUDialect>();
+    registry.insert<LLVM::LLVMDialect, mlir::MTGPU::MTGPUDialect,
+                    mlir::triton::mthreads_gpu::TritonMthreadsGPUDialect>();
   }
 
   ConvertTritonMTGPUToLLVM(int32_t computeCapability)
@@ -87,7 +126,8 @@ struct ConvertTritonMTGPUToLLVM
 
     mlir::LowerToLLVMOptions option(context);
     option.overrideIndexBitwidth(32);
-    TritonGPUToLLVMTypeConverter typeConverter(context, option);
+    TargetInfo targetInfo(computeCapability);
+    TritonGPUToLLVMTypeConverter typeConverter(context, option, targetInfo);
     TritonLLVMConversionTarget convTarget(*context);
     int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
     int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
@@ -101,11 +141,12 @@ struct ConvertTritonMTGPUToLLVM
     // Lower functions
     {
       mlir::LowerToLLVMOptions option(context);
-      TritonGPUToLLVMTypeConverter typeConverter(context, option);
+      TritonGPUToLLVMTypeConverter typeConverter(context, option, targetInfo);
       TritonLLVMFunctionConversionTarget funcTarget(*context);
       RewritePatternSet funcPatterns(context);
       mlir::triton::MUSA::populateFuncOpConversionPattern(
-          typeConverter, funcPatterns, numWarps, patternBenefitDefault);
+          typeConverter, funcPatterns, numWarps, threadsPerWarp,
+          patternBenefitDefault);
       mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
                                                             funcPatterns);
       if (failed(
@@ -121,7 +162,6 @@ struct ConvertTritonMTGPUToLLVM
     OpBuilder::InsertPoint indexInsertPoint;
 
     RewritePatternSet patterns(context);
-    TargetInfo targetInfo(computeCapability);
     int benefit = patternBenefitPrioritizeOverLLVMConversions;
     mlir::triton::MUSA::populateConvertLayoutOpToLLVMPatterns(
         typeConverter, targetInfo, patterns, benefit);
@@ -134,23 +174,21 @@ struct ConvertTritonMTGPUToLLVM
                                   patternBenefitClampOptimizedPattern);
     populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo, patterns,
                                       axisInfoAnalysis, benefit);
-    mlir::triton::populateReduceOpToLLVMPatterns(typeConverter, patterns,
-                                                 targetInfo, benefit);
+    mlir::triton::MUSA::populateReduceOpToLLVMPatterns(typeConverter, patterns,
+                                                       targetInfo, benefit);
     mlir::triton::populateScanOpToLLVMPatterns(typeConverter, patterns,
                                                targetInfo, benefit);
+    populateBarrierOpToLLVMPatterns(typeConverter, patterns, benefit);
     mlir::triton::populateHistogramOpToLLVMPatterns(typeConverter, patterns,
                                                     targetInfo, benefit);
     mlir::triton::populatePrintOpToLLVMPattern(typeConverter, patterns,
                                                targetInfo, benefit);
     mlir::triton::populateControlFlowOpToLLVMPattern(typeConverter, patterns,
-                                                     benefit);
+                                                     targetInfo, benefit);
     mlir::triton::MUSA::populateSPMDOpToLLVMPattern(typeConverter, patterns,
                                                     benefit);
     mlir::triton::populateSPMDOpToLLVMPattern(typeConverter, patterns,
                                               targetInfo, benefit);
-    // TODO(thomas): this should probably be done in a separate step to not
-    // interfere with our own lowering of arith ops. Add arith/math's patterns
-    // to help convert scalar expression to LLVM.
     mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
     mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
 
@@ -159,6 +197,7 @@ struct ConvertTritonMTGPUToLLVM
 
     mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
                                                           patterns);
+    mlir::ub::populateUBToLLVMConversionPatterns(typeConverter, patterns);
     mlir::triton::populateViewOpToLLVMPatterns(typeConverter, patterns,
                                                benefit);
     mlir::triton::populateAssertOpToLLVMPattern(typeConverter, patterns,
@@ -167,8 +206,18 @@ struct ConvertTritonMTGPUToLLVM
                                                 patterns, benefit);
     mlir::triton::populateMakeRangeOpToLLVMPattern(typeConverter, targetInfo,
                                                    patterns, benefit);
-    if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
+    if (failed(applyPartialConversion(mod, convTarget, std::move(patterns)))) {
       return signalPassFailure();
+    }
+
+    {
+      RewritePatternSet cleanupPatterns(context);
+      cleanupPatterns.add<CancelRedundantBFloatRoundTripPattern>(context);
+      if (failed(
+              applyPatternsAndFoldGreedily(mod, std::move(cleanupPatterns)))) {
+        return signalPassFailure();
+      }
+    }
   }
 
 private:
@@ -186,7 +235,7 @@ private:
     auto arrayTy = LLVM::LLVMArrayType::get(elemTy, 0);
     auto global = b.create<LLVM::GlobalOp>(
         loc, arrayTy, /*isConstant=*/false, LLVM::Linkage::External,
-        "global_smem", /*value=*/Attribute(), /*alignment=*/16,
+        "global_smem", /*value=*/Attribute(), /*alignment=*/256,
         static_cast<unsigned>(
             mlir::MTGPU::MTGPUMemorySpace::kSharedMemorySpace));
   }

@@ -43,7 +43,7 @@ def test_metadata() -> None:
     assert used_hook
 
 
-def test_memory_leak(device: str) -> None:
+def test_memory_leak(device) -> None:
 
     @triton.jit
     def kernel(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr):

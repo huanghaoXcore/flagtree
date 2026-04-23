@@ -8,6 +8,7 @@ using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
 namespace {
+
 struct SplatOpConversion : public ConvertOpToLLVMPattern<triton::SplatOp> {
   using ConvertOpToLLVMPattern<triton::SplatOp>::ConvertOpToLLVMPattern;
   // Convert SplatOp or arith::ConstantOp with SplatElementsAttr to a
@@ -24,13 +25,20 @@ struct SplatOpConversion : public ConvertOpToLLVMPattern<triton::SplatOp> {
     // Check the converted type for the tensor as depending on the encoding the
     // converter may pick different element types.
     auto srcType = typeConverter->convertType(tensorTy);
+    // Use the element type when the tensor lowers to a vector or struct.
+    Type scalarType = srcType;
     if (auto structTy = dyn_cast<LLVM::LLVMStructType>(srcType))
-      srcType = structTy.getBody()[0];
+      scalarType = structTy.getBody()[0];
+    else if (auto vecTy = dyn_cast<VectorType>(srcType))
+      scalarType = vecTy.getElementType();
+    else if (auto vecTy = dyn_cast<LLVM::LLVMFixedVectorType>(srcType))
+      scalarType = vecTy.getElementType();
     // If the type sizes don't match we need to pack constants.
-    if (srcType.isIntOrFloat() && constVal.getType().getIntOrFloatBitWidth() !=
-                                      srcType.getIntOrFloatBitWidth()) {
+    if (scalarType.isIntOrFloat() &&
+        constVal.getType().getIntOrFloatBitWidth() !=
+            scalarType.getIntOrFloatBitWidth()) {
       unsigned cstBitWidth = constVal.getType().getIntOrFloatBitWidth();
-      unsigned srcBitWidth = srcType.getIntOrFloatBitWidth();
+      unsigned srcBitWidth = scalarType.getIntOrFloatBitWidth();
       assert(cstBitWidth <= srcBitWidth && srcBitWidth % cstBitWidth == 0);
       unsigned ratio = srcBitWidth / cstBitWidth;
       Type intTy = IntegerType::get(elemType.getContext(), cstBitWidth);
@@ -41,7 +49,7 @@ struct SplatOpConversion : public ConvertOpToLLVMPattern<triton::SplatOp> {
         vec = insert_element(vecType, vec, intCst, int_val(32, i));
       constVal = vec;
     }
-    auto llSrc = bitcast(constVal, srcType);
+    auto llSrc = bitcast(constVal, scalarType);
     size_t elemsPerThread = getTotalElemsPerThread(tensorTy);
     llvm::SmallVector<Value> elems(elemsPerThread, llSrc);
     return packLLElements(loc, typeConverter, elems, rewriter, resType);
@@ -83,8 +91,15 @@ struct ArithConstantSplatOpConversion
                    << value.getType() << "\n";
       return failure();
     }
+    // Lower FP8 constant to int8 constant since FP8 types are not supported on
+    // LLVM IR.
+    if (type::isFloat8(elemType))
+      elemType = rewriter.getIntegerType(8);
     auto constOp = rewriter.create<LLVM::ConstantOp>(loc, elemType, val);
     auto typeConverter = getTypeConverter();
+    if (!dyn_cast<RankedTensorType>(op.getType())) {
+      return failure();
+    }
     auto llStruct = SplatOpConversion::convertSplatLikeOp(
         elemType, op.getType(), constOp, typeConverter, rewriter, loc);
     rewriter.replaceOp(op, llStruct);
@@ -168,11 +183,21 @@ struct SplitOpConversion : public ConvertOpToLLVMPattern<SplitOp> {
     // verifier):
     //
     // - The op has a blocked encoding.
-    // - The last dimension (the one we're spliting) is also the most minor
-    //   dimension, and has sizePerThread=2.
+    // - The last dimension (the one we're spliting) has sizePerThread=2,
+    // threadPerWarp=1 and warpPerBlock=1.
     //
-    // With these invariants, split is trivial: Every other value goes into
-    // return value 0, and every other goes into return value 1.
+    // With these invariants, split is trivial: We can count how many contiguous
+    // registers belong to the same chunk then we separate the registers between
+    // two different chunks.
+    int numContiguousValues = 1;
+    auto encoding = cast<BlockedEncodingAttr>(
+        cast<RankedTensorType>(op.getSrc().getType()).getEncoding());
+    int splitDim = encoding.getOrder().size() - 1;
+    for (int i = 0; i < encoding.getOrder().size(); i++) {
+      if (encoding.getOrder()[i] == splitDim)
+        break;
+      numContiguousValues *= encoding.getSizePerThread()[i];
+    }
     Location loc = op->getLoc();
     auto typeConverter = getTypeConverter();
     SmallVector<Value> srcVals =
@@ -180,9 +205,11 @@ struct SplitOpConversion : public ConvertOpToLLVMPattern<SplitOp> {
     assert(srcVals.size() % 2 == 0);
     SmallVector<Value> outLhsVals;
     SmallVector<Value> outRhsVals;
-    for (int i = 0; i < srcVals.size(); i += 2) {
-      outLhsVals.push_back(srcVals[i]);
-      outRhsVals.push_back(srcVals[i + 1]);
+    for (int i = 0; i < srcVals.size(); i += 2 * numContiguousValues) {
+      for (int j = 0; j < numContiguousValues; j++) {
+        outLhsVals.push_back(srcVals[i + j]);
+        outRhsVals.push_back(srcVals[i + numContiguousValues + j]);
+      }
     }
     auto resultTy = cast<RankedTensorType>(op.getResult(0).getType());
     Value retLhs =
@@ -247,6 +274,7 @@ struct ExpandDimsOpConversion : public ConvertOpToLLVMPattern<ExpandDimsOp> {
       offset.erase(offset.begin() + srcLayout.getDim());
       resultVals.push_back(srcValues.at(offset));
     }
+
     Value ret =
         packLLElements(loc, typeConverter, resultVals, rewriter, resultTy);
     rewriter.replaceOp(op, ret);
@@ -371,7 +399,7 @@ struct MemDescSubviewOpConversion
     // Compute the offset based on the original strides of the shared memory
     // object
     auto offset = dot(rewriter, loc, opOffsetVals, smemObj.strides);
-    auto elemPtrTy = ptr_ty(rewriter.getContext(), 3);
+    auto elemPtrTy = smemObj.base.getType();
     smemObj =
         SharedMemoryObject(gep(elemPtrTy, llvmElemTy, smemObj.base, offset),
                            llvmElemTy, strides, offsetVals);

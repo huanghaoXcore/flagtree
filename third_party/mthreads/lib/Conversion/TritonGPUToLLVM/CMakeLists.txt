@@ -1,7 +1,21 @@
-if (FLAGTREE_BACKEND)
-    set(NVGPUIR "")
-else()
-    set(NVGPUIR "NVGPUIR")
+
+set(TRITON_GPU_TO_LLVM_LINK_LIBS
+    MLIRIR
+    MLIRPass
+    MLIRGPUDialect
+    MLIRGPUToNVVMTransforms
+    MLIRGPUToROCDLTransforms
+    MLIRGPUTransforms
+    TritonAnalysis
+    TritonIR
+    TritonGPUIR
+    TritonGPUTransforms
+)
+
+if(FLAGTREE_PLUGIN)
+  list(APPEND TRITON_GPU_TO_LLVM_LINK_LIBS
+       TritonMthreadsGPUTransforms
+       MTGPUIR)
 endif()
 
 add_triton_library(TritonGPUToLLVM
@@ -29,15 +43,5 @@ add_triton_library(TritonGPUToLLVM
     TritonGPUConversionPassIncGen
 
     LINK_LIBS PUBLIC
-    MLIRIR
-    MLIRPass
-    MLIRGPUDialect
-    MLIRGPUToNVVMTransforms
-    MLIRGPUToROCDLTransforms
-    MLIRGPUTransforms
-    TritonAnalysis
-    TritonIR
-    TritonGPUIR
-    TritonGPUTransforms
-    ${NVGPUIR}
+    ${TRITON_GPU_TO_LLVM_LINK_LIBS}
 )

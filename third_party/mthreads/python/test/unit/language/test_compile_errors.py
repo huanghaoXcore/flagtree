@@ -1,11 +1,32 @@
+import contextlib
 import pytest
+import os
 
+import torch
 import triton
 import triton.language as tl
 from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 import traceback
 
-pytestmark = pytest.mark.skip(reason="Skipping entire test file")
+
+def is_interpreter():
+    return os.environ.get('TRITON_INTERPRET', '0') == '1'
+
+
+def is_cuda():
+    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
+def is_hip():
+    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+def is_musa():
+    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "musa"
+
+
+def is_on_mi300():
+    return is_hip() and triton.runtime.driver.active.get_current_target().arch in ('gfx940', 'gfx941', 'gfx942')
 
 
 def test_err_undefined_variable():
@@ -133,7 +154,8 @@ def test_err_in_builtin():
     try:
         inner = e.value.__cause__
         outer = e.value
-        assert "/core.py" in '\n'.join(traceback.format_tb(inner.__traceback__)), "error should point inside core.py"
+        assert f"{os.sep}core.py" in '\n'.join(traceback.format_tb(
+            inner.__traceback__)), "error should point inside core.py"
 
         assert "at 2:4:" in str(outer), "error should point to expand_dims call"
         assert "<source unavailable>" not in str(outer)
@@ -155,6 +177,15 @@ def test_two_returns_no_err():
         a + tl.arange(0, 4)  # only works if we took the first return
 
     triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constants={}))
+
+
+def test_not_const_annotate_no_err():
+
+    @triton.jit
+    def kernel(N: int = 1):
+        pass
+
+    triton.compile(triton.compiler.ASTSource(fn=kernel, signature={'N': 'i32'}, constants={}))
 
 
 @triton.jit
@@ -303,4 +334,43 @@ def test_global_access_in_fn_default_arg():
         pass
 
     # No error.
-    triton.compile(triton.compiler.ASTSource(fn=kernel, signature={0: "i32"}, constants={}))
+    triton.compile(triton.compiler.ASTSource(fn=kernel, signature={'a': "i32"}, constants={}))
+
+
+def test_defaults_assign_no_err():
+
+    @triton.jit
+    def kernel(a=1, B: tl.constexpr = ""):
+        pass
+
+    triton.compile(triton.compiler.ASTSource(fn=kernel, signature={'a': 'i32'}, constants={'B': ""}))
+
+
+def test_where_warning(fresh_triton_cache):
+
+    @triton.jit
+    def kernel():
+        a = tl.full((64, ), 0, tl.uint32)
+        b = tl.full((64, ), 1, tl.float32)
+        c = tl.full((64, ), 2, tl.float32)
+        tl.where(a, b, c)
+
+    with pytest.warns(UserWarning):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constants={}))
+
+
+def test_max_num_imprecise_acc_limit():
+
+    @triton.jit
+    def dot_kernel():
+        SIZE: tl.constexpr = 64
+        a = tl.full((SIZE, SIZE), 0.0, tl.float8e5)
+        b = tl.full((SIZE, SIZE), 0.0, tl.float8e5)
+        tl.dot(a, b, max_num_imprecise_acc=128)
+
+    with pytest.raises(CompilationError) as e:
+        triton.compile(triton.compiler.ASTSource(fn=dot_kernel, signature={}, constants={}))
+    try:
+        assert (str(e.value.__cause__) == "max_num_imprecise_acc (128) must be <= K (64)")
+    except AssertionError as assertion_err:
+        raise assertion_err from e.value

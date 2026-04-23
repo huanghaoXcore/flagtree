@@ -16,7 +16,6 @@ def annotated_function(return_type=None, **arg_types):
 
 
 # Test integer annotations
-@pytest.mark.skip(reason="TO FIX")
 @pytest.mark.parametrize(("signed", "width"), [
     (signed, width) for signed in [False, True]\
                     for width in [8, 16, 32, 64]

@@ -25,7 +25,9 @@ public:
   matchAndRewrite(mlir::Operation *op,
                   mlir::PatternRewriter &rewriter) const override {
     auto callOp = cast<LLVM::CallOp>(op);
-    if (isPredicatedLoad(callOp)) {
+    if (isPredicatedAsyncLoad(callOp)) {
+      return convertPredicatedAsyncLoad(callOp, rewriter);
+    } else if (isPredicatedLoad(callOp)) {
       return convertPredicatedLoad(callOp, rewriter);
     } else if (isPredicatedStore(callOp)) {
       return convertPredicatedStore(callOp, rewriter);
@@ -35,6 +37,11 @@ public:
   }
 
 private:
+  bool isPredicatedAsyncLoad(LLVM::CallOp callOp) const {
+    return callOp.getCallee().value().find(
+               mlir::LLVM::MUSA::Predicated_AsyncLoad) != llvm::StringRef::npos;
+  }
+
   bool isPredicatedLoad(LLVM::CallOp callOp) const {
     return callOp.getCallee().value().find(mlir::LLVM::MUSA::Predicated_Load) !=
            llvm::StringRef::npos;
@@ -98,6 +105,39 @@ private:
     rewriter.replaceOp(callOp, loadVal);
     return mlir::success();
   }
+
+  LogicalResult
+  convertPredicatedAsyncLoad(LLVM::CallOp callOp,
+                             mlir::PatternRewriter &rewriter) const {
+    auto operands = callOp.getOperands();
+    auto loc = callOp.getLoc();
+
+    auto dst = operands[0];
+    auto src = operands[1];
+    auto cpSize = operands[2];
+    auto prefetchSize = operands[3];
+    auto pred = operands[4];
+    SmallVector<Value> asyncLoadOps = {dst, src, cpSize, prefetchSize};
+
+    Block *currentBlock = rewriter.getInsertionBlock();
+    Block *afterLoad =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    Block *trueBlock = rewriter.createBlock(afterLoad);
+    rewriter.setInsertionPointToEnd(currentBlock);
+    rewriter.create<LLVM::CondBrOp>(loc, pred, trueBlock, afterLoad);
+
+    // true block
+    rewriter.setInsertionPointToStart(trueBlock);
+    StringRef cpAsyncFucName = "llvm.musa.memcpy.g2s";
+    LLVM::createLLVMIntrinsicCallOp(rewriter, loc, cpAsyncFucName, TypeRange{},
+                                    asyncLoadOps);
+    rewriter.create<LLVM::BrOp>(loc, afterLoad);
+
+    rewriter.setInsertionPointToStart(afterLoad);
+    assert(callOp.getNumResults() == 0 && "expected void call");
+    rewriter.eraseOp(callOp);
+    return mlir::success();
+  }
 };
 
 struct ConvertBuiltinFuncToLLVM
@@ -107,11 +147,8 @@ struct ConvertBuiltinFuncToLLVM
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
-    // Disable block merging because of:
-    // https://github.com/llvm/llvm-project/issues/63230
-    // TODO(giuseros): enable block merging once the above ticket is completed
     GreedyRewriteConfig config;
-    config.enableRegionSimplification = false;
+    config.enableRegionSimplification = GreedySimplifyRegionLevel::Disabled;
 
     RewritePatternSet patterns(context);
     patterns.add<CallOpConversion>(context);
@@ -125,13 +162,11 @@ struct ConvertBuiltinFuncToLLVM
 
 } // anonymous namespace
 
-namespace mlir {
-namespace triton {
+namespace mlir::triton {
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMTGPUBuiltinFuncToLLVMPass() {
   return std::make_unique<ConvertBuiltinFuncToLLVM>();
 }
 
-} // namespace triton
-} // namespace mlir
+} // namespace mlir::triton

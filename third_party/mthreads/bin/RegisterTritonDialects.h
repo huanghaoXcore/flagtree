@@ -37,9 +37,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerAllocateSharedMemoryPass();
   mlir::registerLLVMDIScope();
 
-  // TODO(mthreads): registerMthreadsPasses is not working currently,
-  // since both libtriton.so and mthreadsTritonPlugin.so are linked the
-  // MLIRPass.a
   auto backend_register_func =
       load_backend_register_func("mthreads", "registerMthreadsPasses");
   backend_register_func();

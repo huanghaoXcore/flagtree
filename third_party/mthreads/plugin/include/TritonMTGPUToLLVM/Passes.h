@@ -17,13 +17,21 @@ namespace triton {
 #define GEN_PASS_DECL
 #include "mthreads/plugin/include/TritonMTGPUToLLVM/Passes.h.inc"
 
-namespace MUSA {} // namespace MUSA
+namespace MUSA {
+std::unique_ptr<OperationPass<ModuleOp>>
+createDecomposeUnsupportedConversionsPass();
 
+} // namespace MUSA
+
+std::unique_ptr<Pass> createTritonMTGPUAccelerateSQMMAPass();
+std::unique_ptr<Pass> createTritonMTGPUMarkInplaceLoadsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertTritonMTGPUToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonMTGPUToLLVMPass(int32_t computeCapability);
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMTGPUBuiltinFuncToLLVMPass();
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertMTGPUInplaceLoadToLLVMPass();
 
 #define GEN_PASS_REGISTRATION
 #include "mthreads/plugin/include/TritonMTGPUToLLVM/Passes.h.inc"

@@ -1,5 +1,10 @@
-﻿#include "TritonMTGPUToLLVM/MUSATranslation.h"
+﻿#include "Dialect/MTGPU/IR/Dialect.h"
+#include "Dialect/TritonMthreadsGPU/IR/Dialect.h"
+#include "Dialect/TritonMthreadsGPU/Transforms/Passes.h"
+#include "MTGPUToLLVM/MTGPUToLLVMPass.h"
+#include "TritonMTGPUToLLVM/MUSATranslation.h"
 #include "TritonMTGPUToLLVM/Passes.h"
+#include "TritonMTGPUTransforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/MTGPU/MTGPUToLLVMIRTranslation.h"
 #include "passes.h"
@@ -11,17 +16,11 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 
-#ifdef _WIN32
-#define PLUGIN_EXPORT __declspec(dllexport)
-#else
-#define PLUGIN_EXPORT __attribute__((visibility("default")))
-#endif
-
 namespace py = pybind11;
 
 using namespace mlir;
 
-PLUGIN_EXPORT void init_triton_mthreads_passes_ttgpuir(py::module &&m) {
+void init_triton_musa_passes_ttgpuir(py::module &&m) {
   using namespace mlir::triton;
 
   // ttgir -> llvm dialect
@@ -31,17 +30,39 @@ PLUGIN_EXPORT void init_triton_mthreads_passes_ttgpuir(py::module &&m) {
   m.def("add_mtgpu_builtin_func_to_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createConvertMTGPUBuiltinFuncToLLVMPass());
   });
+  m.def("add_mark_inplace_loads", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createTritonMTGPUMarkInplaceLoadsPass());
+  });
+  m.def("add_inplace_load_to_llvm", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createConvertMTGPUInplaceLoadToLLVMPass());
+  });
+  ADD_PASS_WRAPPER_1("add_accelerate_wmma",
+                     mlir::createTritonMTGPUAccelerateWMMAPass, bool);
+  ADD_PASS_WRAPPER_0("add_accelerate_sqmma",
+                     mlir::triton::createTritonMTGPUAccelerateSQMMAPass);
 }
 
-PLUGIN_EXPORT void init_triton_mthreads(py::module &&m) {
+void init_triton_musa_passes_ttmtgpuir(py::module &&m) {
+  ADD_PASS_WRAPPER_0("add_tme_lowering",
+                     mlir::createTritonMthreadsGPUTMELoweringPass);
+  ADD_PASS_WRAPPER_0("add_mtgpu_to_llvm",
+                     mlir::triton::createConvertMTGPUToLLVMPass);
+  ADD_PASS_OPTION_WRAPPER_1("add_mtgpu_pipeline", createTritonMTGPUPipeline,
+                            int);
+}
+
+void init_triton_mthreads(py::module &&m) {
   using ret = py::return_value_policy;
 
   auto passes = m.def_submodule("passes");
-  init_triton_mthreads_passes_ttgpuir(passes.def_submodule("ttgpuir"));
+  init_triton_musa_passes_ttgpuir(passes.def_submodule("ttgpuir"));
+  init_triton_musa_passes_ttmtgpuir(passes.def_submodule("ttmtgpuir"));
 
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
+    registry.insert<mlir::triton::mthreads_gpu::TritonMthreadsGPUDialect,
+                    mlir::triton::mtgpu::MTGPUDialect>();
     mlir::registerMTGPUDialectTranslation(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
@@ -83,11 +104,4 @@ PLUGIN_EXPORT void init_triton_mthreads(py::module &&m) {
                                    "v96:128";
     module.setDataLayout(dataLayout);
   });
-}
-
-extern "C" {
-PLUGIN_EXPORT void registerMthreadsPasses() {
-  mlir::triton::registerConvertTritonMTGPUToLLVM();
-  mlir::triton::registerConvertMTGPUBuiltinFuncToLLVM();
-}
 }

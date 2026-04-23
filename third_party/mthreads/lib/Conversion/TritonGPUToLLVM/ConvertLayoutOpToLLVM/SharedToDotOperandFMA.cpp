@@ -12,7 +12,6 @@ using ::mlir::triton::gpu::getOrder;
 using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::getSizePerThread;
 using ::mlir::triton::gpu::getTotalElemsPerThread;
-using ::mlir::triton::gpu::isaDistributedLayout;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 
 SmallVector<Value>
@@ -117,12 +116,16 @@ Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
 
   Value _0 = i32_val(0);
 
-  Value mContig = i32_val(sizePerThread[order[1]]);
+  int mContigInt = sizePerThread[order[1]];
+  Value mContig = i32_val(mContigInt);
 
   // threadId in blocked layout
   auto threadIds = getThreadIds(thread, shapePerCTATile, sizePerThread, order,
                                 rewriter, loc);
   Value threadIdM = threadIds[0];
+  // Wrap to the unique data range when the layout over-subscribes threads.
+  int threadsPerM = (M + mContigInt - 1) / mContigInt;
+  threadIdM = urem(threadIdM, i32_val(threadsPerM));
 
   Value offA0 = isARow ? _0 : mul(threadIdM, mContig);
   Value offA1 = isARow ? mul(threadIdM, mContig) : _0;
@@ -132,7 +135,7 @@ Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
   }
   auto elemTy = typeConverter->convertType(aTensorTy.getElementType());
 
-  Type ptrTy = ptr_ty(rewriter.getContext(), 3);
+  Type ptrTy = aSmem.base.getType();
   SmallVector<Value> aPtrs(aNumPtr);
   for (int i = 0; i < aNumPtr; ++i)
     aPtrs[i] = gep(ptrTy, elemTy, aSmem.base, aOff[i]);
@@ -183,12 +186,16 @@ Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
 
   Value _0 = i32_val(0);
 
-  Value nContig = i32_val(sizePerThread[order[0]]);
+  int nContigInt = sizePerThread[order[0]];
+  Value nContig = i32_val(nContigInt);
 
   // threadId in blocked layout
   auto threadIds = getThreadIds(thread, shapePerCTATile, sizePerThread, order,
                                 rewriter, loc);
   Value threadIdN = threadIds[1];
+  // Wrap to the unique data range when the layout over-subscribes threads.
+  int threadsPerN = (N + nContigInt - 1) / nContigInt;
+  threadIdN = urem(threadIdN, i32_val(threadsPerN));
 
   Value offB0 = isBRow ? mul(threadIdN, nContig) : _0;
   Value offB1 = isBRow ? _0 : mul(threadIdN, nContig);
@@ -198,7 +205,7 @@ Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
   }
   auto elemTy = typeConverter->convertType(bTensorTy.getElementType());
 
-  Type ptrTy = ptr_ty(rewriter.getContext(), 3);
+  Type ptrTy = bSmem.base.getType();
   SmallVector<Value> bPtrs(bNumPtr);
   for (int i = 0; i < bNumPtr; ++i)
     bPtrs[i] = gep(ptrTy, elemTy, bSmem.base, bOff[i]);

@@ -1,5 +1,7 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
+include_directories(${CMAKE_SOURCE_DIR}/third_party/mthreads/include)
+include_directories(${CMAKE_BINARY_DIR}/third_party/mthreads/include)
 add_subdirectory(include)
 add_subdirectory(lib)
 
@@ -14,7 +16,11 @@ if(TRITON_BUILD_PYTHON_MODULE)
     POSITION_INDEPENDENT_CODE ON
   )
   target_link_libraries(mthreadsTritonPlugin PRIVATE
+    TritonMTGPUTransforms
     TritonMTGPUToLLVM
+    MTGPUToLLVM
+    MLIRMTGPUDialect
+    MLIRMTGPUToLLVMIRTranslation
     # Py
     ${Python3_LIBRARIES}
     ${PYTHON_LDFLAGS}

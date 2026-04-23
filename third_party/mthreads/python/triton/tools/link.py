@@ -23,6 +23,7 @@ class KernelLinkerMeta:
     triton_suffix: str
     suffix: str
     num_specs: int
+    backend: str
     """ number of specialized arguments """
 
 
@@ -31,39 +32,47 @@ class HeaderParser:
     def __init__(self) -> None:
         import re
 
-        # [kernel_name, c signature]
-        self.linker_directives = re.compile("//[\\s]*tt-linker:[\\s]*([\\w]+):(.+):(.+)")
         # [name, hash, suffix]
         self.kernel_name = re.compile("^([\\w]+)_([\\w]+)_([\\w]+)$")
         # [(type, name)]
         self.c_sig = re.compile("[\\s]*(\\w+)\\s(\\w+)[,]?")
         # [d|c]
         self.arg_suffix = re.compile("[c,d]")
+        self.linker_prefix = "// tt-linker:"
 
         self.kernels = defaultdict(list)
 
     def extract_linker_meta(self, header: str):
         for ln in header.splitlines():
-            if ln.startswith("//"):
-                m = self.linker_directives.match(ln)
-                if _exists(m):
-                    ker_name, c_sig, algo_info = m.group(1), m.group(2), m.group(3)
-                    name, sig_hash, suffix = self._match_name(ker_name)
-                    c_types, arg_names = self._match_c_sig(c_sig)
-                    num_specs, sizes = self._match_suffix(suffix, c_sig)
-                    self._add_kernel(
-                        "_".join([name, algo_info]),
-                        KernelLinkerMeta(
-                            orig_kernel_name=name,
-                            arg_names=arg_names,
-                            arg_ctypes=c_types,
-                            sizes=sizes,
-                            sig_hash=sig_hash,
-                            triton_suffix=suffix,
-                            suffix=suffix,
-                            num_specs=num_specs,
-                        ),
-                    )
+            ln = ln.strip()
+            if not ln.startswith(self.linker_prefix):
+                continue
+            payload = ln[len(self.linker_prefix):].strip()
+            parts = payload.split(":", 3)
+            if len(parts) == 3:
+                ker_name, c_sig, algo_info = parts
+                backend = "cuda"
+            elif len(parts) == 4:
+                ker_name, c_sig, algo_info, backend = parts
+            else:
+                raise LinkerError(f"Malformed linker directive: {ln}")
+            name, sig_hash, suffix = self._match_name(ker_name)
+            c_types, arg_names = self._match_c_sig(c_sig)
+            num_specs, sizes = self._match_suffix(suffix, c_sig)
+            self._add_kernel(
+                "_".join([name, algo_info]),
+                KernelLinkerMeta(
+                    orig_kernel_name=name,
+                    arg_names=arg_names,
+                    arg_ctypes=c_types,
+                    sizes=sizes,
+                    sig_hash=sig_hash,
+                    triton_suffix=suffix,
+                    suffix=suffix,
+                    num_specs=num_specs,
+                    backend=backend,
+                ),
+            )
 
     def _match_name(self, ker_name: str):
         m = self.kernel_name.match(ker_name)
@@ -115,8 +124,32 @@ class HeaderParser:
                     raise LinkerError(
                         f"Mismatched signature for kernel {name}: \n\texisting sig is: {','.join(last.arg_ctypes)}\n\tcurrent is: {','.join(ker.arg_ctypes)}"
                     )
+            if last.backend != ker.backend:
+                raise LinkerError(
+                    f"Mismatched backend for kernel {name}: existing backend is {last.backend}, current is {ker.backend}"
+                )
 
         self.kernels[name].append(ker)
+
+
+def get_backend_info(backend: str):
+    backend_map = {
+        "cuda": {
+            "driver_include": "cuda.h",
+            "result_ty": "CUresult",
+            "stream_ty": "CUstream",
+            "invalid_value": "CUDA_ERROR_INVALID_VALUE",
+        },
+        "musa": {
+            "driver_include": "musa.h",
+            "result_ty": "MUresult",
+            "stream_ty": "MUstream",
+            "invalid_value": "MUSA_ERROR_INVALID_VALUE",
+        },
+    }
+    if backend not in backend_map:
+        raise LinkerError(f"Unsupported linker backend: {backend}")
+    return backend_map[backend]
 
 
 def gen_signature_with_full_args(m):
@@ -132,8 +165,9 @@ def gen_signature(m):
 
 # generate declarations of kernels with meta-parameter and constant values
 def make_algo_decls(name: str, metas: Sequence[KernelLinkerMeta]) -> str:
+    info = get_backend_info(metas[-1].backend)
     return f"""
-CUresult {name}(CUstream stream, {gen_signature_with_full_args(metas[-1])});
+{info["result_ty"]} {name}({info["stream_ty"]} stream, {gen_signature_with_full_args(metas[-1])});
 void load_{name}();
 void unload_{name}();
     """
@@ -141,9 +175,10 @@ void unload_{name}();
 
 # generate declarations of kernels with meta-parameter and constant values
 def make_global_decl(meta: KernelLinkerMeta) -> str:
+    info = get_backend_info(meta.backend)
     return f"""
-CUresult {meta.orig_kernel_name}_default(CUstream stream, {gen_signature_with_full_args(meta)});
-CUresult {meta.orig_kernel_name}(CUstream stream, {gen_signature_with_full_args(meta)}, int algo_id);
+{info["result_ty"]} {meta.orig_kernel_name}_default({info["stream_ty"]} stream, {gen_signature_with_full_args(meta)});
+{info["result_ty"]} {meta.orig_kernel_name}({info["stream_ty"]} stream, {gen_signature_with_full_args(meta)}, int algo_id);
 void load_{meta.orig_kernel_name}();
 void unload_{meta.orig_kernel_name}();
     """
@@ -151,7 +186,8 @@ void unload_{meta.orig_kernel_name}();
 
 # generate dispatcher function for kernels with different meta-parameter and constant values
 def make_default_algo_kernel(meta: KernelLinkerMeta) -> str:
-    src = f"CUresult {meta.orig_kernel_name}_default(CUstream stream, {gen_signature_with_full_args(meta)}){{\n"
+    info = get_backend_info(meta.backend)
+    src = f"{info['result_ty']} {meta.orig_kernel_name}_default({info['stream_ty']} stream, {gen_signature_with_full_args(meta)}){{\n"
     src += (f"  return {meta.orig_kernel_name}(stream, {', '.join(meta.arg_names)}, 0);\n")
     src += "}\n"
     return src
@@ -159,12 +195,13 @@ def make_default_algo_kernel(meta: KernelLinkerMeta) -> str:
 
 # generate dispatcher function for kernels with different integer value hints
 def make_kernel_hints_dispatcher(name: str, metas: Sequence[KernelLinkerMeta]) -> str:
+    info = get_backend_info(metas[-1].backend)
     src = f"// launcher for: {name}\n"
     for meta in sorted(metas, key=lambda m: -m.num_specs):
-        src += f"CUresult {meta.orig_kernel_name}_{meta.sig_hash}_{meta.suffix}(CUstream stream, {gen_signature(meta)});\n"
+        src += f"{info['result_ty']} {meta.orig_kernel_name}_{meta.sig_hash}_{meta.suffix}({info['stream_ty']} stream, {gen_signature(meta)});\n"
     src += "\n"
 
-    src += (f"CUresult {name}(CUstream stream, {gen_signature_with_full_args(metas[-1])}){{")
+    src += (f"{info['result_ty']} {name}({info['stream_ty']} stream, {gen_signature_with_full_args(metas[-1])}){{")
     src += "\n"
     for meta in sorted(metas, key=lambda m: -m.num_specs):
         cond_fn = (  #
@@ -183,7 +220,7 @@ def make_kernel_hints_dispatcher(name: str, metas: Sequence[KernelLinkerMeta]) -
         arg_names = [arg for arg, hint in zip(meta.arg_names, meta.sizes) if hint != 1]
         src += f"    return {meta.orig_kernel_name}_{meta.sig_hash}_{meta.suffix}(stream, {', '.join(arg_names)});\n"
     src += "\n"
-    src += "  return CUDA_ERROR_INVALID_VALUE;\n"
+    src += f"  return {info['invalid_value']};\n"
     src += "}\n"
 
     for mode in ["load", "unload"]:
@@ -200,7 +237,8 @@ def make_kernel_hints_dispatcher(name: str, metas: Sequence[KernelLinkerMeta]) -
 
 # generate dispatcher function for kernels with different meta-parameter and constant values
 def make_kernel_meta_const_dispatcher(meta: KernelLinkerMeta) -> str:
-    src = f"CUresult {meta.orig_kernel_name}(CUstream stream, {gen_signature_with_full_args(meta)}, int algo_id){{\n"
+    info = get_backend_info(meta.backend)
+    src = f"{info['result_ty']} {meta.orig_kernel_name}({info['stream_ty']} stream, {gen_signature_with_full_args(meta)}, int algo_id){{\n"
     src += f"  assert (algo_id < (int)sizeof({meta.orig_kernel_name}_kernels));\n"
     src += f"  return {meta.orig_kernel_name}_kernels[algo_id](stream, {', '.join(meta.arg_names)});\n"
     src += "}\n"
@@ -209,8 +247,10 @@ def make_kernel_meta_const_dispatcher(meta: KernelLinkerMeta) -> str:
 
 # generate definition of function pointers of kernel dispatchers based on meta-parameter and constant values
 def make_func_pointers(names: str, meta: KernelLinkerMeta) -> str:
+    info = get_backend_info(meta.backend)
     # the table of hint dispatchers
-    src = f"typedef CUresult (*kernel_func_t)(CUstream stream, {gen_signature_with_full_args(meta)});\n"
+    src = (f"typedef {info['result_ty']} (*kernel_func_t)"
+           f"({info['stream_ty']} stream, {gen_signature_with_full_args(meta)});\n")
     src += f"kernel_func_t {meta.orig_kernel_name}_kernels[] = {{\n"
     for name in names:
         src += f"  {name},\n"
@@ -283,10 +323,14 @@ if __name__ == "__main__":
     algo_decls = [make_algo_decls(name, meta) for name, meta in parser.kernels.items()]
     meta_lists = [meta for name, meta in parser.kernels.items()]
     meta = meta_lists[0][0]
+    backends = {m.backend for metas in meta_lists for m in metas}
+    if len(backends) != 1:
+        raise LinkerError(f"Expected a single backend across linked kernels, but found: {sorted(backends)}")
+    backend_info = get_backend_info(next(iter(backends)))
     get_num_algos_decl = make_get_num_algos_decl(meta)
     global_decl = make_global_decl(meta)
     with args.out.with_suffix(".h").open("w") as fp:
-        out = "#include <cuda.h>\n"
+        out = f"#include <{backend_info['driver_include']}>\n"
         out += "\n".join(algo_decls)
         out += "\n"
         out += get_num_algos_decl
@@ -304,7 +348,7 @@ if __name__ == "__main__":
     default_algo_kernel = make_default_algo_kernel(meta)
     with args.out.with_suffix(".c").open("w") as fp:
         out = ""
-        out += "#include <cuda.h>\n"
+        out += f"#include <{backend_info['driver_include']}>\n"
         out += "#include <stdint.h>\n"
         out += "#include <assert.h>\n"
         out += "\n"

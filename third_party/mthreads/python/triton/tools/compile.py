@@ -1,5 +1,6 @@
 import binascii
 import hashlib
+import importlib
 import importlib.util
 import sys
 from argparse import ArgumentParser
@@ -7,15 +8,100 @@ from pathlib import Path
 from typing import List
 
 import triton
+import triton.backends
+from triton.backends.compiler import GPUTarget
 from triton.compiler.code_generator import kernel_suffix
-from triton.backends.nvidia.driver import ty_to_cpp
+
+
+def _parse_target_arg(parser, args):
+    target_args = (args.target_backend, args.target_arch, args.target_warp_size)
+    if all(arg is None for arg in target_args):
+        return None
+    if any(arg is None for arg in target_args):
+        parser.error("--target-backend, --target-arch, and --target-warp-size must be specified together")
+    try:
+        arch = int(args.target_arch)
+    except ValueError:
+        arch = args.target_arch
+    return GPUTarget(args.target_backend, arch, args.target_warp_size)
+
+
+def _get_backend_info(target):
+    backend_map = {
+        "cuda": {
+            "driver_module":
+            "triton.backends.nvidia.driver",
+            "driver_include":
+            "cuda.h",
+            "result_ty":
+            "CUresult",
+            "stream_ty":
+            "CUstream",
+            "module_ty":
+            "CUmodule",
+            "function_ty":
+            "CUfunction",
+            "success_value":
+            "CUDA_SUCCESS",
+            "error_prefix":
+            "CUDA",
+            "get_error_string_fn":
+            "cuGetErrorString",
+            "module_unload_fn":
+            "cuModuleUnload",
+            "module_load_data_fn":
+            "cuModuleLoadData",
+            "module_get_function_fn":
+            "cuModuleGetFunction",
+            "launch_fn":
+            "cuLaunchKernel",
+            "binary_suffix":
+            "cubin",
+            "load_preamble_template":
+            "    int dev = 0;\n    int shared = {shared};\n",
+            "post_load_setup_template":
+            ("    int shared_optin;\n"
+             "    DRIVER_CHECK(cuDeviceGetAttribute(&shared_optin, "
+             "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, dev));\n"
+             "    if (shared > 49152 && shared_optin > 49152) {{\n"
+             "      DRIVER_CHECK(cuFuncSetCacheConfig({kernel_name}_func, CU_FUNC_CACHE_PREFER_SHARED));\n"
+             "      DRIVER_CHECK(cuFuncSetAttribute({kernel_name}_func, "
+             "CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_optin));\n"
+             "    }}\n"),
+        },
+        "musa": {
+            "driver_module": "triton.backends.mtgpu.driver",
+            "driver_include": "musa.h",
+            "result_ty": "MUresult",
+            "stream_ty": "MUstream",
+            "module_ty": "MUmodule",
+            "function_ty": "MUfunction",
+            "success_value": "MUSA_SUCCESS",
+            "error_prefix": "MUSA",
+            "get_error_string_fn": "muGetErrorString",
+            "module_unload_fn": "muModuleUnload",
+            "module_load_data_fn": "muModuleLoadData",
+            "module_get_function_fn": "muModuleGetFunction",
+            "launch_fn": "muLaunchKernel",
+            "binary_suffix": "mubin",
+            "load_preamble_template": "    int shared = {shared};\n    (void)shared;\n",
+            "post_load_setup_template": "",
+        },
+    }
+    if target.backend not in backend_map:
+        raise RuntimeError(f"Unsupported AOT backend: {target.backend}")
+    info = dict(backend_map[target.backend])
+    driver_module = importlib.import_module(info["driver_module"])
+    info["ty_to_cpp"] = driver_module.ty_to_cpp
+    return info
+
 
 desc = """
 Triton ahead-of-time compiler:
 
 This program compiles the kernel with name `kernel-name` in the file at the
-provided `path` into self-contained C source-code that embeds the `cubin`
-data along with utilities to load, unload and launch the kernel.
+provided `path` into self-contained C source-code that embeds the compiled
+device binary along with utilities to load, unload and launch the kernel.
 
 signature is provided as a list of (optionally divisibility-hinted) types
 or constexpr values, e.g.
@@ -51,6 +137,9 @@ if __name__ == "__main__":
     parser.add_argument("--out-path", "-o", type=Path, default=None, help="Out filename")
     parser.add_argument("--signature", "-s", type=str, help="Signature of the kernel", required=True)
     parser.add_argument("--grid", "-g", type=str, help="Launch grid of the kernel", required=True)
+    parser.add_argument("--target-backend", type=str, default=None, help="Explicit target backend, e.g. cuda or musa")
+    parser.add_argument("--target-arch", type=str, default=None, help="Explicit target architecture")
+    parser.add_argument("--target-warp-size", type=int, default=None, help="Explicit target warp size")
     args = parser.parse_args()
 
     out_name = args.out_name if args.out_name else args.kernel_name
@@ -92,52 +181,117 @@ if __name__ == "__main__":
 
     hints = {i: constexpr(s.split(":")[1]) for i, s in enumerate(signature) if ":" in s}
     hints = {k: v for k, v in hints.items() if v is not None}
-    constants = {i: constexpr(s) for i, s in enumerate(signature)}
+    constants = {kernel.arg_names[i]: constexpr(s) for i, s in enumerate(signature)}
     constants = {k: v for k, v in constants.items() if v is not None}
-    signature = {i: s.split(":")[0] for i, s in enumerate(signature) if i not in constants}
+    signature = {
+        kernel.arg_names[i]: s.split(":")[0]
+        for i, s in enumerate(signature)
+        if kernel.arg_names[i] not in constants
+    }
     const_sig = 'x'.join([str(v) for v in constants.values()])
-    doc_string = [f"{kernel.arg_names[i]}={constants[i]}" for i in constants.keys()]
+    doc_string = [f"{k}={v}" for k, v in constants.items()]
     doc_string += [f"num_warps={args.num_warps}", f"num_stages={args.num_stages}"]
 
     # compile ast into cubin
     for h in hints.values():
         assert h in [1, 16], f"Only 1 and 16 are valid hints, got {h}"
-    divisible_by_16 = [i for i, h in hints.items() if h == 16]
-    equal_to_1 = [i for i, h in hints.items() if h == 1]
-    attrs = triton.compiler.AttrsDescriptor(divisible_by_16=divisible_by_16, equal_to_1=equal_to_1)
-    for i in equal_to_1:
-        constants.update({i: 1})
+    attrs = triton.backends.compiler.AttrsDescriptor.from_hints(hints)
+    for p, v in attrs.get_constants().items():
+        constants.update({kernel.arg_names[p]: v})
     src = triton.compiler.ASTSource(fn=kernel, constants=constants, signature=signature, attrs=attrs)
     opts = {"num_warps": args.num_warps, "num_stages": args.num_stages}
-    ccinfo = triton.compile(src, options=opts)
+    target = _parse_target_arg(parser, args)
+    compile_kwargs = {"options": opts}
+    if target is not None:
+        compile_kwargs["target"] = target
+    ccinfo = triton.compile(src, **compile_kwargs)
+    backend = triton.compiler.make_backend(ccinfo.metadata.target)
+    backend_info = _get_backend_info(ccinfo.metadata.target)
     arg_names = []
     arg_types = []
-    for i in signature.keys():
-        if i not in equal_to_1:
-            arg_names += [kernel.arg_names[i]]
-            arg_types += [signature[i]]
+    arg_names_not_1 = []
+    arg_types_not_1 = []
+    for i, arg_name in enumerate(kernel.arg_names):
+        if arg_name not in constants:
+            arg_names.append(arg_name)
+            arg_types.append(signature[arg_name])
+            arg_names_not_1.append(arg_name)
+            arg_types_not_1.append(signature[arg_name])
+        elif i in attrs.equal_to_1:
+            arg_names.append(arg_name)
+            arg_types.append(signature[arg_name])
 
     # dump C stub code
     suffix = kernel_suffix(signature.values(), attrs)
     func_name = '_'.join([out_name, sig_hash, suffix])
-    hex_ = str(binascii.hexlify(ccinfo.asm["cubin"]))[2:-1]
+    binary_ext = backend.binary_ext
+    hex_ = str(binascii.hexlify(ccinfo.asm[binary_ext]))[2:-1]
+    binary_kernel_name = getattr(ccinfo.metadata, "name", args.kernel_name)
     params = {
-        "kernel_name": func_name,
-        "triton_kernel_name": args.kernel_name,
-        "bin_size": len(hex_),
-        "bin_data": ", ".join([f"0x{x}{y}" for x, y in zip(hex_[::2], hex_[1::2])]),
-        "signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names, arg_types)]),
-        "full_signature": ", ".join([f"{ty_to_cpp(signature[i])} {kernel.arg_names[i]}" for i in signature.keys()]),
-        "arg_pointers": ", ".join([f"&{arg}" for arg in arg_names]),
-        "num_args": len(arg_names),
-        "kernel_docstring": doc_string,
-        "shared": ccinfo.metadata.shared,
-        "num_warps": args.num_warps,
-        "algo_info": '_'.join([const_sig, meta_sig]),
-        "gridX": grid[0],
-        "gridY": grid[1],
-        "gridZ": grid[2],
-        "_placeholder": "",
+        "backend":
+        ccinfo.metadata.target.backend,
+        "driver_include":
+        backend_info["driver_include"],
+        "result_ty":
+        backend_info["result_ty"],
+        "stream_ty":
+        backend_info["stream_ty"],
+        "module_ty":
+        backend_info["module_ty"],
+        "function_ty":
+        backend_info["function_ty"],
+        "success_value":
+        backend_info["success_value"],
+        "error_prefix":
+        backend_info["error_prefix"],
+        "get_error_string_fn":
+        backend_info["get_error_string_fn"],
+        "module_unload_fn":
+        backend_info["module_unload_fn"],
+        "module_load_data_fn":
+        backend_info["module_load_data_fn"],
+        "module_get_function_fn":
+        backend_info["module_get_function_fn"],
+        "launch_fn":
+        backend_info["launch_fn"],
+        "binary_suffix":
+        backend_info["binary_suffix"],
+        "kernel_name":
+        func_name,
+        "triton_kernel_name":
+        binary_kernel_name,
+        "bin_size":
+        len(hex_),
+        "bin_data":
+        ", ".join([f"0x{x}{y}" for x, y in zip(hex_[::2], hex_[1::2])]),
+        "signature":
+        ", ".join([f"{backend_info['ty_to_cpp'](ty)} {name}" for name, ty in zip(arg_names_not_1, arg_types_not_1)]),
+        "full_signature":
+        ", ".join([f"{backend_info['ty_to_cpp'](ty)} {name}" for name, ty in zip(arg_names, arg_types)]),
+        "arg_pointers":
+        ", ".join([f"&{arg}" for arg in arg_names_not_1]),
+        "num_args":
+        len(arg_names_not_1),
+        "kernel_docstring":
+        doc_string,
+        "shared":
+        ccinfo.metadata.shared,
+        "block_dim_x":
+        args.num_warps * ccinfo.metadata.target.warp_size,
+        "load_preamble":
+        backend_info["load_preamble_template"].format(shared=ccinfo.metadata.shared),
+        "post_load_setup":
+        backend_info["post_load_setup_template"].format(kernel_name=func_name),
+        "algo_info":
+        '_'.join([const_sig, meta_sig]),
+        "gridX":
+        grid[0],
+        "gridY":
+        grid[1],
+        "gridZ":
+        grid[2],
+        "_placeholder":
+        "",
     }
     for ext in ['h', 'c']:
         template_path = Path(__file__).parent / f"compile.{ext}"
