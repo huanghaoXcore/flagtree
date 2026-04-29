@@ -603,8 +603,7 @@ class _attention(torch.autograd.Function):
                 output.stride(1), output.stride(2), B=B, Q_N=Q_N, Q_D=Q_D, Q_S=Q_S, KV_S=KV_S, K_D=K_D,
                 V_D=v_sparse.shape[3], sparse_mode=sparse_mode, O_N=output.shape[1], O_D=output.shape[2],
                 actual_seq_lengths_query=actual_seq_lengths_query, actual_seq_lengths_kv=actual_seq_lengths_kv,
-                blk_size=128, Q_BLOCK_SIZE=16,
-                limit_auto_multi_buffer_only_for_local_buffer=False,
+                blk_size=128, Q_BLOCK_SIZE=16, limit_auto_multi_buffer_only_for_local_buffer=False,
                 limit_auto_multi_buffer_of_local_buffer="no-limit")
 
         else:
@@ -884,7 +883,7 @@ def test_op(T, B, KV_S, Q_N, KV_N, D, D_rope, sparse_size, scale_value, sparse_b
         layout_kv='PA_BSND',
         sparse_mode=sparse_mode,
         block_table=block_table,
-        attention_mode = 2,
+        attention_mode=2,
     )
     triton_out = triton_out.to(npu_out.dtype)
     torch.testing.assert_close(triton_out, npu_out, rtol=1e-2, atol=1e-2, equal_nan=True)
@@ -926,7 +925,7 @@ def test_op(T, B, KV_S, Q_N, KV_N, D, D_rope, sparse_size, scale_value, sparse_b
             layout_kv='PA_BSND',
             sparse_mode=sparse_mode,
             block_table=block_table,
-            attention_mode = 2,
+            attention_mode=2,
         ), clear_l2_cache=True, collect_prof=False)
     print(f"[Torch-NPU SFA] Time: {npu_time:.4f} us")
 
